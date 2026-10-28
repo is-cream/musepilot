@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.4.8"
+VERSION = "0.4.9"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -1660,7 +1660,11 @@ class QueueWorker(threading.Thread):
         if not item:
             return
         cfg = app.config
-        ok, usage = app.ledger.can_invoke(int(cfg.get("prompt_budget", 30)))
+        # v0.4.9: the 5-hour window budget is a Muse Code (Meta) limit only.
+        # Claude Code and Baseten direct run on Baseten, not on that window,
+        # so they must never be held by it — in the queue or in /api/chat.
+        qprovider = item.get("provider") or cfg.get("provider") or "meta"
+        ok, usage = (True, {}) if qprovider != "meta" else app.ledger.can_invoke(int(cfg.get("prompt_budget", 30)))
         if not ok:
             # put it back to queued; try again later
             with app.queue._lock:
@@ -2496,14 +2500,18 @@ class Handler(BaseHTTPRequestHandler):
             if not prompt:
                 self._send_json({"error": "empty prompt"}, 400)
                 return
-            if app.driver._run_lock.locked():
-                self._send_json({"error": "busy",
-                                 "hint": "Muse Code is already running — queue this prompt instead."},
-                                409)
-                return
             cfg = app.config
+            chat_provider = body.get("provider") or cfg.get("provider") or "meta"
+            if app.driver._run_lock.locked():
+                busy_hint = ("Claude Code is already running — queue this prompt instead."
+                             if chat_provider == "claude" else
+                             "Baseten is already running — queue this prompt instead."
+                             if chat_provider == "baseten" else
+                             "Muse Code is already running — queue this prompt instead.")
+                self._send_json({"error": "busy", "hint": busy_hint}, 409)
+                return
             budget = int(cfg.get("prompt_budget", 30))
-            can, _usage = app.ledger.can_invoke(budget)
+            can, _usage = (True, {}) if chat_provider != "meta" else app.ledger.can_invoke(budget)
             if not can and not body.get("force"):
                 self._send_json({
                     "error": "window_exhausted",
@@ -2536,7 +2544,7 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-            provider = body.get("provider") or cfg.get("provider") or "meta"
+            provider = chat_provider
             chat_atts = resolve_attachments(body.get("attachments"))
             try:
                 if provider == "claude":
@@ -3258,12 +3266,12 @@ function addMsg(role, meta){
   return d;
 }
 
-async function sendChat(force=false){
+async function sendChat(force=false, promptOverride=null){
   // Voice: sending stops transcription first, so the full transcribed
   // text (including the last spoken words) is what gets sent — the
   // user never has to stop the mic before tapping Send.
   if (typeof stopVoiceAndFlush === 'function') await stopVoiceAndFlush();
-  const prompt = $('prompt').value.trim();
+  const prompt = (promptOverride || $('prompt').value).trim();
   if (!prompt) return;
   const sel = currentSelections();
   const sentAtts = ATTACHMENTS.slice(); ATTACHMENTS = []; renderAttachments();
@@ -3285,7 +3293,7 @@ async function sendChat(force=false){
       body.innerHTML = '<span class="warn">5-hour budget exhausted.</span> ' + esc(j.hint||'') +
         '<br><button class="ghost" id="forcebtn" style="margin-top:8px">Run anyway</button> ' +
         '<button class="ghost" id="qbtn2" style="margin-top:8px">Queue instead</button>';
-      $('forcebtn').onclick = () => sendChat(true);
+      $('forcebtn').onclick = () => sendChat(true, prompt);
       $('qbtn2').onclick = () => { $('prompt').value = prompt; queuePrompt(); };
       return;
     }
@@ -3343,7 +3351,7 @@ async function refreshQueue(){
   try {
     const q = await api('/api/queue');
     const el = $('qlist');
-    if (!q.items.length) { const provQ = (CFG && CFG.provider) || 'meta'; el.innerHTML = '<span class="src">Empty. Queue a prompt and it will ' + (provQ === 'claude' ? 'invoke Claude Code' : (provQ === 'baseten' ? 'ask Baseten' : 'invoke Muse Code')) + ' as soon as your 5-hour budget allows.</span>'; return; }
+    if (!q.items.length) { const provQ = (CFG && CFG.provider) || 'meta'; el.innerHTML = '<span class="src">Empty. Queue a prompt and it will ' + (provQ === 'claude' ? 'invoke Claude Code' : (provQ === 'baseten' ? 'ask Baseten' : 'invoke Muse Code')) + (provQ === 'meta' ? ' as soon as your 5-hour budget allows.' : '.') + '</span>'; return; }
     el.innerHTML = '';
     q.items.forEach(it => {
       const d = document.createElement('div'); d.className='qitem';

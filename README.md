@@ -7,6 +7,20 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.4.9)
+
+- **5-hour budget is Muse Code only** — the budget gate was applied to
+  every provider, so Claude Code and Baseten direct were blocked with
+  "5-hour budget exhausted" even though they run on Baseten, not on
+  Meta's 5-hour window. The gate now applies only to Muse Code, in
+  both direct sends and queued prompts. Claude and Baseten prompts run
+  even when the Muse window is used up.
+- **Run anyway actually works** — the Run anyway button called Send
+  with no prompt, but Send had already cleared the prompt box, so it
+  silently did nothing. It now resends the original prompt with
+  force=true. For Muse Code this bypasses the gate, as intended;
+  Queue instead was already restoring the prompt and still works.
+
 ## What's inside (v0.4.8)
 
 - **File and image attachments** — 📎 Attach in the composer, or paste
