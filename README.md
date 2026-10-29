@@ -7,6 +7,28 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.5.0)
+
+- **Stop button** — while a prompt is running you now see a pulsing
+  "● working…" indicator with **Stop** and **Queue** buttons right under
+  the reply. Stop kills the running CLI process immediately (all three
+  providers) instead of leaving you stuck on "already running".
+- **Send now for queued prompts** — every queued item has a **Send now**
+  button. It stops any in-flight run first, then runs that prompt
+  immediately with the same streaming view as a normal send. The
+  5-hour budget still applies (the item goes back in the queue on
+  refusal) unless you run it with force.
+- **In-progress indication everywhere** — the top bar shows a pulsing
+  "● running…" pill with a Stop button whenever the server is busy,
+  even if the run was started from another tab or before the page loaded
+  (checked every 3 seconds).
+- **Previous conversations** — the sidebar now lists every saved chat
+  session with its first prompt, message count and time. Click one to
+  open it; each conversation keeps its own CLI session memory, so
+  reopening one resumes where it left off instead of starting blank.
+- **Queue while running** — the Queue button is now visible during a
+  run, so you can line up the next prompt without waiting.
+
 ## What's inside (v0.4.9)
 
 - **5-hour budget is Muse Code only** — the budget gate was applied to

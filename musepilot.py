@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.4.9"
+VERSION = "0.5.0"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -1339,6 +1339,25 @@ class ExecDriver:
         self.auth = auth
         self._run_lock = threading.Lock()
         self.active_run = None  # run-id when a run is in flight
+        self.active_proc = None  # Popen of the in-flight CLI run (for Stop)
+        self._stop_requested = threading.Event()
+
+    def stop(self):
+        """Ask the in-flight run to stop; terminate its subprocess if any.
+
+        Returns True when a run was in flight (lock held or child alive).
+        The run loop notices the flag, kills the child, records
+        "Run stopped by user." and releases the lock in its finally block.
+        """
+        self._stop_requested.set()
+        proc = self.active_proc
+        alive = proc is not None and proc.poll() is None
+        if alive:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001 - already gone is fine
+                pass
+        return alive or self._run_lock.locked()
 
     def build_command(self, prompt, *, model=None, effort=None,
                       context_window=None, max_steps=None, session_id=None,
@@ -1383,6 +1402,7 @@ class ExecDriver:
 
         run_id = uuid.uuid4().hex[:12]
         self.active_run = run_id
+        self._stop_requested.clear()
         prompt_path = None
         try:
             # Write prompt to a temp file to avoid any shell-quoting issues.
@@ -1409,6 +1429,7 @@ class ExecDriver:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL, text=True, cwd=workdir,
                 bufsize=1, env=child_env)
+            self.active_proc = proc
 
             full_text_parts = []
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -1427,6 +1448,14 @@ class ExecDriver:
 
             try:
                 for line in proc.stdout:
+                    if self._stop_requested.is_set():
+                        try:
+                            proc.kill()
+                        except Exception:  # noqa: BLE001 - already gone is fine
+                            pass
+                        error = "Run stopped by user."
+                        emit("error", {"error": error})
+                        break
                     if now_ts() - started > max_runtime:
                         proc.kill()
                         error = f"Run exceeded the {max_runtime//60}-minute limit and was stopped."
@@ -1456,6 +1485,9 @@ class ExecDriver:
                     _, stderr_text = proc.communicate(timeout=5)
                 except Exception:
                     stderr_text = ""
+                if self._stop_requested.is_set():
+                    # Prefer the user's stop over the SIGTERM exit code.
+                    error = "Run stopped by user."
                 if proc.returncode not in (0, None) and not error:
                     tail = (stderr_text or "").strip().splitlines()
                     error = ("muse exited with code %s%s"
@@ -1496,6 +1528,7 @@ class ExecDriver:
                 except OSError:
                     pass
             self.active_run = None
+            self.active_proc = None
             self._run_lock.release()
 
 # ---------------------------------------------------------------------------
@@ -1827,11 +1860,15 @@ def claude_baseten_env(api_key):
     return env
 
 
-def claude_chat_stream(binary, api_key, prompt, effort, workdir, auto_approve, on_event, timeout=600, session_id=None, resume=False):
+def claude_chat_stream(binary, api_key, prompt, effort, workdir, auto_approve, on_event, timeout=600, session_id=None, resume=False,
+                     stop_event=None, register_proc=None):
     """Run `claude -p` (Baseten) and stream text/tool events.
 
     Returns (text, usage, error). Usage total = input + cache-read +
     output, matching how MusePilot counts Baseten direct usage.
+    stop_event (threading.Event, optional) aborts the run promptly with
+    "Run stopped by user."; register_proc(proc) exposes the child so a
+    stopper can terminate a hung process.
     """
     import subprocess
     tools = CLAUDE_WRITE_TOOLS if auto_approve else CLAUDE_READ_TOOLS
@@ -1858,9 +1895,20 @@ def claude_chat_stream(binary, api_key, prompt, effort, workdir, auto_approve, o
                                 text=True, cwd=cwd, env=env)
     except Exception as e:  # noqa: BLE001 - launch errors are user-facing
         return "", usage, "Could not launch Claude Code: %s" % str(e)[:200]
+    if register_proc:
+        try:
+            register_proc(proc)
+        except Exception:  # noqa: BLE001 - registration is best-effort
+            pass
     err_tail = ""
     try:
         for line in proc.stdout:
+            if stop_event is not None and stop_event.is_set():
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001 - already gone is fine
+                    pass
+                return "".join(text_parts), usage, "Run stopped by user."
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -1911,13 +1959,16 @@ def claude_chat_stream(binary, api_key, prompt, effort, workdir, auto_approve, o
 # stream chunk when stream_options.include_usage is honoured.
 # ---------------------------------------------------------------------------
 
-def baseten_chat_stream(api_key, prompt, effort, on_event, max_tokens=BASETEN_MAX_TOKENS, attachments=None):
+def baseten_chat_stream(api_key, prompt, effort, on_event, max_tokens=BASETEN_MAX_TOKENS, attachments=None,
+                      stop_event=None):
     """Stream one Baseten chat reply. Returns (text, usage, error).
 
     Attachments (v0.4.8): Baseten direct has no file tools, so it cannot
     read a local path. Text files are inlined into the prompt (capped),
     images are sent as vision blocks. Other file types are named, with a
     note that Claude/Muse mode can read them — never silently dropped.
+    stop_event (threading.Event, optional) aborts the stream promptly
+    with "Run stopped by user.".
     """
     import urllib.error
     import urllib.request
@@ -1971,6 +2022,8 @@ def baseten_chat_stream(api_key, prompt, effort, on_event, max_tokens=BASETEN_MA
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             for raw in resp:
+                if stop_event is not None and stop_event.is_set():
+                    return "".join(text_parts), usage, "Run stopped by user."
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -2225,12 +2278,13 @@ class App:
             raise RuntimeError("Another run is already in progress.")
         run_id = uuid.uuid4().hex[:12]
         started = now_ts()
+        self.driver._stop_requested.clear()
         try:
             if on_event:
                 on_event("event", {"run_id": run_id, "cmd": "baseten chat completions"})
             text, usage, error = baseten_chat_stream(
                 key, prompt, effort or self.config.get("baseten_effort") or "xhigh", on_event,
-                attachments=attachments)
+                attachments=attachments, stop_event=self.driver._stop_requested)
             result = {"run_id": run_id, "ok": error is None, "error": error,
                       "text": text, "usage": usage, "steps": 0,
                       "model": BASETEN_MODEL,
@@ -2247,27 +2301,80 @@ class App:
                                 "provider": "baseten", "ok": result["ok"]})
             return result
         finally:
+            self.driver.active_proc = None
             self.driver._run_lock.release()
 
 
-    def get_muse_session_id(self):
-        """Stable Muse session UUID for the current conversation."""
-        sid = self.config.get("muse_session_id")
+    def _conversation_sessions(self):
+        """Per-conversation CLI session ids: {cid: {"muse": uuid, "claude": uuid}}.
+
+        v0.5.0: opening a previous conversation restores its own CLI
+        session instead of clobbering the current one. Legacy top-level
+        keys are migrated into the current conversation's slot on read.
+        """
+        sessions = self.config.get("conversation_sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+            self.config["conversation_sessions"] = sessions
+        return sessions
+
+    def _conversation_session_id(self, key):
+        cid = str(int(self.config.get("conversation_id") or 1))
+        sessions = self._conversation_sessions()
+        slot = sessions.get(cid)
+        sid = slot.get(key) if isinstance(slot, dict) else None
         if not is_valid_uuid(sid):
-            sid = str(uuid.uuid4())
-            self.config["muse_session_id"] = sid
+            # Migrate the legacy top-level key once, then generate.
+            sid = self.config.get("muse_session_id" if key == "muse" else "claude_session_id")
+            if not is_valid_uuid(sid):
+                sid = str(uuid.uuid4())
+            slot = dict(slot) if isinstance(slot, dict) else {}
+            slot[key] = sid
+            if key == "claude":
+                slot["claude_started"] = False
+            sessions[cid] = slot
+            self.config["conversation_sessions"] = sessions
             save_config(self.config)
         return sid
 
+    def _set_conversation_session_id(self, key, sid):
+        cid = str(int(self.config.get("conversation_id") or 1))
+        sessions = self._conversation_sessions()
+        slot = dict(sessions.get(cid) or {})
+        slot[key] = sid
+        if key == "claude":
+            slot["claude_started"] = False
+        sessions[cid] = slot
+        self.config["conversation_sessions"] = sessions
+        save_config(self.config)
+
+    def get_muse_session_id(self):
+        """Stable Muse session UUID for the current conversation."""
+        return self._conversation_session_id("muse")
+
     def get_claude_session_id(self):
         """Stable Claude session UUID for the current conversation."""
-        sid = self.config.get("claude_session_id")
-        if not is_valid_uuid(sid):
-            sid = str(uuid.uuid4())
-            self.config["claude_session_id"] = sid
-            self.config["claude_session_started"] = False
-            save_config(self.config)
-        return sid
+        return self._conversation_session_id("claude")
+
+    def get_claude_started(self):
+        """Whether this conversation's Claude session was ever started."""
+        cid = str(int(self.config.get("conversation_id") or 1))
+        slot = self._conversation_sessions().get(cid) or {}
+        if "claude_started" in slot:
+            return bool(slot["claude_started"])
+        # Legacy fallback: the old single global flag.
+        return bool(self.config.get("claude_session_started"))
+
+    def set_claude_started(self, value):
+        cid = str(int(self.config.get("conversation_id") or 1))
+        sessions = self._conversation_sessions()
+        slot = dict(sessions.get(cid) or {})
+        slot["claude_started"] = bool(value)
+        sessions[cid] = slot
+        self.config["conversation_sessions"] = sessions
+        # Keep the legacy global flag in sync for older readers.
+        self.config["claude_session_started"] = bool(value)
+        save_config(self.config)
 
     def new_conversation(self):
         """Start a fresh conversation: new saved file + fresh session ids."""
@@ -2331,6 +2438,56 @@ class App:
             pass
         return {"conversation_id": cid, "file": path, "messages": messages}
 
+    def list_conversations(self):
+        """All saved conversations, newest last: id, message count,
+        first-prompt preview, last activity ts, and which is current."""
+        ensure_dirs()
+        current = int(self.config.get("conversation_id") or 1)
+        out = []
+        try:
+            files = sorted(os.listdir(CONVERSATIONS_DIR))
+        except OSError:
+            files = []
+        for fn in files:
+            m = re.match(r"conversation-(\d+)\.jsonl$", fn)
+            if not m:
+                continue
+            cid = int(m.group(1))
+            path = os.path.join(CONVERSATIONS_DIR, fn)
+            messages = []
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            messages.append(json.loads(line))
+                        except ValueError:
+                            continue
+            except OSError:
+                pass
+            first_prompt = next((x.get("prompt") or "" for x in messages if x.get("prompt")), "")
+            last_ts = messages[-1].get("ts") if messages else None
+            out.append({"id": cid, "messages": len(messages),
+                        "preview": first_prompt[:120], "last_ts": last_ts,
+                        "current": cid == current})
+        return out
+
+    def open_conversation(self, cid):
+        """Switch the current conversation to a previous one and return
+        its transcript. The conversation keeps its own CLI session ids
+        (see _conversation_sessions), so resuming it continues where it
+        left off instead of clobbering the session."""
+        ensure_dirs()
+        cid = int(cid)
+        path = conversation_file_path(cid)
+        if not os.path.exists(path):
+            raise FileNotFoundError("conversation-%03d.jsonl" % cid)
+        self.config["conversation_id"] = cid
+        save_config(self.config)
+        return self.load_conversation()
+
     def run_claude_chat(self, prompt, effort=None, workdir=None, auto_approve=False, on_event=None, attachments=None):
         """One Claude Code (Baseten) run, using the driver lock + ledger.
 
@@ -2351,32 +2508,33 @@ class App:
         run_id = uuid.uuid4().hex[:12]
         started = now_ts()
         eff = effort or self.config.get("baseten_effort") or "xhigh"
+        self.driver._stop_requested.clear()
+        _reg = lambda p: setattr(self.driver, "active_proc", p)
         try:
             if on_event:
                 on_event("event", {"run_id": run_id, "cmd": "claude -p (Baseten)"})
             session_id = self.get_claude_session_id()
-            resume = bool(self.config.get("claude_session_started"))
+            resume = self.get_claude_started()
             prompt_full = prompt + attachments_prompt_suffix(attachments or [])
             text, usage, error = claude_chat_stream(
                 binary, key, prompt_full, eff,
                 workdir or self.config.get("default_workdir"),
                 auto_approve, on_event,
-                session_id=session_id, resume=resume)
+                session_id=session_id, resume=resume,
+                stop_event=self.driver._stop_requested, register_proc=_reg)
             if error and resume and any(w in error.lower() for w in ("resume", "session", "not found", "no such")):
                 # The stored session is gone (Claude storage cleared, etc).
                 # Retry once on a fresh session rather than failing forever.
                 fresh_id = str(uuid.uuid4())
-                self.config["claude_session_id"] = fresh_id
-                self.config["claude_session_started"] = False
-                save_config(self.config)
+                self._set_conversation_session_id("claude", fresh_id)
                 text, usage, error = claude_chat_stream(
                     binary, key, prompt_full, eff,
                     workdir or self.config.get("default_workdir"),
                     auto_approve, on_event,
-                    session_id=fresh_id, resume=False)
+                    session_id=fresh_id, resume=False,
+                    stop_event=self.driver._stop_requested, register_proc=_reg)
             if not error:
-                self.config["claude_session_started"] = True
-                save_config(self.config)
+                self.set_claude_started(True)
             result = {"run_id": run_id, "ok": error is None, "error": error,
                       "text": text, "usage": usage, "steps": 0,
                       "model": BASETEN_MODEL, "effort": eff,
@@ -2392,6 +2550,7 @@ class App:
                                 "provider": "claude", "ok": result["ok"]})
             return result
         finally:
+            self.driver.active_proc = None
             self.driver._run_lock.release()
 
 
@@ -2477,6 +2636,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"runs": list_run_records()})
         elif path == "/api/conversation":
             self._send_json(app.load_conversation())
+        elif path == "/api/conversations":
+            self._send_json({"conversations": app.list_conversations()})
         elif path == "/api/clis":
             self._send_json({"clis": self.server.app.cli_manager.status()})
         elif path == "/api/config":
@@ -2489,10 +2650,115 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "not found"}, 404)
 
+    def _run_chat_sse(self, app, cfg, body, prompt, chat_provider):
+        """Run one chat prompt with server-sent-event streaming.
+
+        Shared by /api/chat and /api/queue/<id>/send-now. The busy and
+        budget gates are the caller's job; body carries model, effort,
+        context_window, max_steps, workdir, auto_approve and attachments
+        exactly like a /api/chat body.
+        """
+        # v0.4.7: Muse session id is a server-persisted UUID, not the
+        # UI 12-hex id (which changed on every page load and broke memory).
+        session_id = app.get_muse_session_id()
+        run_id_holder = {}
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        # Tell any proxy in the path not to buffer the stream: each
+        # sse_send() below flushes, so a chunk the CLI emits now
+        # must reach the browser now, not at run end.
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def on_event(kind, payload):
+            if kind == "event" and payload.get("run_id"):
+                run_id_holder["run_id"] = payload["run_id"]
+            try:
+                sse_send(self, {"kind": kind, **payload})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        provider = chat_provider
+        chat_atts = resolve_attachments(body.get("attachments"))
+        try:
+            if provider == "claude":
+                result = app.run_claude_chat(
+                    prompt,
+                    effort=body.get("effort") or cfg.get("baseten_effort") or "xhigh",
+                    workdir=body.get("workdir") or cfg.get("default_workdir"),
+                    auto_approve=bool(body.get("auto_approve", cfg.get("auto_approve", False))),
+                    on_event=on_event, attachments=chat_atts)
+            elif provider == "baseten":
+                result = app.run_baseten_chat(
+                    prompt,
+                    effort=body.get("effort") or cfg.get("baseten_effort") or "xhigh",
+                    on_event=on_event, attachments=chat_atts)
+            else:
+                result = app.driver.run(
+                    prompt,
+                    model=body.get("model") or cfg.get("default_model"),
+                    effort=body.get("effort") or cfg.get("default_effort"),
+                    context_window=body.get("context_window"),
+                    max_steps=body.get("max_steps") or cfg.get("default_max_steps"),
+                    session_id=session_id,
+                    auto_approve=bool(body.get("auto_approve", cfg.get("auto_approve", False))),
+                    workdir=body.get("workdir") or cfg.get("default_workdir"),
+                    on_event=on_event, attachments=chat_atts,
+                )
+            save_run_record({
+                "run_id": run_id_holder.get("run_id", uuid.uuid4().hex[:12]),
+                "prompt": prompt[:2000],
+                "model": result.get("model"),
+                "effort": result.get("effort"),
+                "status": "done" if result["ok"] else "error",
+                "text": result["text"],
+                "usage": result["usage"],
+                "error": result.get("error"),
+                "started_at": now_ts() - result.get("elapsed", 0),
+                "finished_at": now_ts(),
+                "interactive": True,
+            })
+            try:
+                app.append_conversation(
+                    provider, prompt, result["text"],
+                    model=result.get("model"), effort=result.get("effort"),
+                    error=result.get("error"), attachments=chat_atts)
+            except Exception:
+                pass
+        except BrokenPipeError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            try:
+                sse_send(self, {"kind": "error", "error": str(e)[:500]})
+                sse_send(self, {"kind": "done", "ok": False, "error": str(e)[:500]})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        return
+
+
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
         app = self.server.app
+
+        if path == "/api/stop":
+            stopped = app.driver.stop()
+            self._send_json({"stopped": stopped,
+                             "busy": app.driver._run_lock.locked()})
+            return
+
+        if path.startswith("/api/conversations/") and path.endswith("/open"):
+            cid = path.rsplit("/", 2)[-2]
+            try:
+                result = app.open_conversation(int(cid))
+            except (ValueError, FileNotFoundError):
+                self._send_json({"error": "unknown conversation"}, 404)
+                return
+            self._send_json(result)
+            return
 
         if path == "/api/chat":
             body = self._read_json()
@@ -2521,84 +2787,7 @@ class Handler(BaseHTTPRequestHandler):
                 }, 429)
                 return
 
-            # v0.4.7: Muse session id is a server-persisted UUID, not the
-            # UI 12-hex id (which changed on every page load and broke memory).
-            session_id = app.get_muse_session_id()
-            run_id_holder = {}
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            # Tell any proxy in the path not to buffer the stream: each
-            # sse_send() below flushes, so a chunk the CLI emits now
-            # must reach the browser now, not at run end.
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-
-            def on_event(kind, payload):
-                if kind == "event" and payload.get("run_id"):
-                    run_id_holder["run_id"] = payload["run_id"]
-                try:
-                    sse_send(self, {"kind": kind, **payload})
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-
-            provider = chat_provider
-            chat_atts = resolve_attachments(body.get("attachments"))
-            try:
-                if provider == "claude":
-                    result = app.run_claude_chat(
-                        prompt,
-                        effort=body.get("effort") or cfg.get("baseten_effort") or "xhigh",
-                        workdir=body.get("workdir") or cfg.get("default_workdir"),
-                        auto_approve=bool(body.get("auto_approve", cfg.get("auto_approve", False))),
-                        on_event=on_event, attachments=chat_atts)
-                elif provider == "baseten":
-                    result = app.run_baseten_chat(
-                        prompt,
-                        effort=body.get("effort") or cfg.get("baseten_effort") or "xhigh",
-                        on_event=on_event, attachments=chat_atts)
-                else:
-                    result = app.driver.run(
-                        prompt,
-                        model=body.get("model") or cfg.get("default_model"),
-                        effort=body.get("effort") or cfg.get("default_effort"),
-                        context_window=body.get("context_window"),
-                        max_steps=body.get("max_steps") or cfg.get("default_max_steps"),
-                        session_id=session_id,
-                        auto_approve=bool(body.get("auto_approve", cfg.get("auto_approve", False))),
-                        workdir=body.get("workdir") or cfg.get("default_workdir"),
-                        on_event=on_event, attachments=chat_atts,
-                    )
-                save_run_record({
-                    "run_id": run_id_holder.get("run_id", uuid.uuid4().hex[:12]),
-                    "prompt": prompt[:2000],
-                    "model": result.get("model"),
-                    "effort": result.get("effort"),
-                    "status": "done" if result["ok"] else "error",
-                    "text": result["text"],
-                    "usage": result["usage"],
-                    "error": result.get("error"),
-                    "started_at": now_ts() - result.get("elapsed", 0),
-                    "finished_at": now_ts(),
-                    "interactive": True,
-                })
-                try:
-                    app.append_conversation(
-                        provider, prompt, result["text"],
-                        model=result.get("model"), effort=result.get("effort"),
-                        error=result.get("error"), attachments=chat_atts)
-                except Exception:
-                    pass
-            except BrokenPipeError:
-                pass
-            except Exception as e:  # noqa: BLE001
-                try:
-                    sse_send(self, {"kind": "error", "error": str(e)[:500]})
-                    sse_send(self, {"kind": "done", "ok": False, "error": str(e)[:500]})
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+            self._run_chat_sse(app, cfg, body, prompt, chat_provider)
             return
 
         if path == "/api/conversation/new":
@@ -2618,6 +2807,57 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": msg[:300]}, status)
                 return
             self._send_json({"attachment": att})
+            return
+
+        if path.startswith("/api/queue/") and path.endswith("/send-now"):
+            # Force a queued prompt to run right now: stop any in-flight
+            # run first, then stream this item like /api/chat. The item
+            # leaves the queue either way (re-queued on budget refusal).
+            item_id = path.rsplit("/", 2)[-2]
+            item = next((it for it in app.queue.list()
+                         if it.get("id") == item_id), None)
+            if not item:
+                self._send_json({"error": "unknown queued item"}, 404)
+                return
+            body = self._read_json()
+            force = bool(body.get("force"))
+            cfg = app.config
+            provider = item.get("provider") or cfg.get("provider") or "meta"
+            if app.driver._run_lock.locked():
+                app.driver.stop()
+                deadline = time.time() + 20
+                while app.driver._run_lock.locked() and time.time() < deadline:
+                    time.sleep(0.2)
+                if app.driver._run_lock.locked():
+                    self._send_json({"error": "busy",
+                                     "hint": "Could not stop the running prompt."}, 409)
+                    return
+            app.queue.remove(item_id)
+            if provider == "meta" and not force:
+                budget = int(cfg.get("prompt_budget", 30))
+                can, _usage = app.ledger.can_invoke(budget)
+                if not can:
+                    app.queue.add(item)  # not lost; back to the queue
+                    self._send_json({
+                        "error": "window_exhausted",
+                        "hint": ("The 5-hour window budget is used up. "
+                                 "The prompt was put back in the queue; "
+                                 "send with force=true to run anyway."),
+                    }, 429)
+                    return
+            chat_body = {
+                "prompt": item.get("prompt"),
+                "provider": provider,
+                "model": item.get("model"),
+                "effort": item.get("effort"),
+                "context_window": item.get("context_window"),
+                "max_steps": item.get("max_steps"),
+                "workdir": item.get("workdir"),
+                "auto_approve": item.get("auto_approve", False),
+                "attachments": item.get("attachments") or [],
+                "force": force,
+            }
+            self._run_chat_sse(app, cfg, chat_body, item.get("prompt"), provider)
             return
 
         if path == "/api/queue":
@@ -2803,6 +3043,16 @@ UI_HTML = r'''<!DOCTYPE html>
           border:1px solid var(--line); color:var(--mut); }
   button.recording { border-color:var(--bad) !important; color:var(--bad) !important; }
   .warn { color:var(--warn); font-size:12px; }
+  .working { color:var(--acc); font-size:12px; animation:mp-pulse 1.2s ease-in-out infinite; }
+  @keyframes mp-pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+  .runctrl { margin-top:8px; display:flex; gap:8px; align-items:center; }
+  .runctrl button { padding:4px 10px; font-size:12px; }
+  #busypill { color:var(--acc); border-color:var(--acc); animation:mp-pulse 1.2s ease-in-out infinite; }
+  .convitem { display:flex; gap:8px; align-items:center; font-size:12px; padding:6px 0;
+              border-bottom:1px dashed var(--line); cursor:pointer; }
+  .convitem .p { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--mut); }
+  .convitem.current .p { color:var(--txt); font-weight:600; }
+  .convitem button { padding:4px 10px; font-size:12px; }
   #runs { font-size:12px; color:var(--mut); }
   .run { border-bottom:1px dashed var(--line); padding:6px 0; }
 </style>
@@ -2819,6 +3069,9 @@ UI_HTML = r'''<!DOCTYPE html>
   <div class="field check"><input type="checkbox" id="yolo"><label for="yolo" style="margin:0">Auto-approve all actions <span class="warn">(yolo)</span></label></div>
   <div class="field"><button class="ghost" id="newchat" style="width:100%">New conversation</button></div>
   <div class="field"><span class="src" id="convinfo"></span></div>
+  <h3>Conversations</h3>
+  <div class="field"><div id="convlist"><span class="src">Loading…</span></div>
+  <div class="src">Previous chat sessions. Click one to open it; it resumes with its own memory.</div></div>
   <h3>Authentication</h3>
   <div class="field">
     <span class="pill" id="authpill" style="cursor:pointer" title="Click for details">checking…</span>
@@ -2853,7 +3106,10 @@ UI_HTML = r'''<!DOCTYPE html>
 </div>
 <div id="main">
   <div id="topbar">
-    <div><h1>MusePilot</h1><span class="ver" id="verlabel">v__VERSION__</span></div>
+    <div><h1>MusePilot</h1><span class="ver" id="verlabel">v__VERSION__</span>
+      <span class="pill" id="busypill" style="display:none">● running…</span>
+      <button class="ghost" id="busystop" style="display:none; padding:2px 10px; font-size:11px">Stop</button>
+    </div>
     <div id="meterwrap">
       <div id="meterbar"><div id="meterfill"></div></div>
       <div id="meterlabel"><span id="dot"></span><span id="metertext">…</span><span id="metertokens"></span><span id="meternext"></span></div>
@@ -3266,70 +3522,157 @@ function addMsg(role, meta){
   return d;
 }
 
-async function sendChat(force=false, promptOverride=null){
+let chatRunning = false;  // this tab currently has a chat run in flight
+let serverBusy = false;   // the server lock is held (another tab / earlier page load)
+
+function makeRunControls(am, prompt, sel){
+  // In-progress indication plus Stop / Queue buttons, visible while a run streams.
+  const ctrl = document.createElement('div');
+  ctrl.className = 'runctrl';
+  const w = document.createElement('span');
+  w.className = 'working'; w.textContent = '\u25cf working\u2026';
+  const stopBtn = document.createElement('button');
+  stopBtn.className = 'ghost'; stopBtn.textContent = 'Stop';
+  stopBtn.title = 'Stop the running prompt';
+  stopBtn.onclick = async () => { try { await fetch('/api/stop', {method:'POST'}); } catch(e){} };
+  const qBtn = document.createElement('button');
+  qBtn.className = 'ghost'; qBtn.textContent = 'Queue';
+  qBtn.title = 'Queue this prompt to run after the current one';
+  qBtn.onclick = () => queuePromptText(prompt, sel);
+  ctrl.appendChild(w); ctrl.appendChild(stopBtn); ctrl.appendChild(qBtn);
+  am.appendChild(ctrl);
+  return ctrl;
+}
+
+async function readChatStream(r, am){
+  const body = am.querySelector('.body'), tools = am.querySelector('.tools');
+  const rd = r.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const {done, value} = await rd.read();
+    if (done) break;
+    buf += dec.decode(value, {stream:true});
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
+      const line = chunk.split('\n').find(l => l.startsWith('data:'));
+      if (!line) continue;
+      let ev; try { ev = JSON.parse(line.slice(5)); } catch(e){ continue; }
+      if (ev.kind === 'text') { body.dataset.raw = (body.dataset.raw || '') + (ev.text || ''); body.innerHTML = renderMarkdown(body.dataset.raw); }
+      else if (ev.kind === 'tool') { const t=document.createElement('div'); t.textContent='\u2699 '+ev.name; tools.appendChild(t); }
+      else if (ev.kind === 'error') { const t=document.createElement('div'); t.className='warn'; t.textContent='\u26a0 '+(ev.error||'error'); body.appendChild(t); }
+      else if (ev.kind === 'usage') { am.querySelector('.meta').textContent += ' \u00b7 ' + (ev.total_tokens||0).toLocaleString() + ' tok'; }
+      am.scrollIntoView({behavior:'smooth', block:'end'});
+    }
+  }
+}
+
+// One full chat turn: user message, assistant message, SSE stream, cleanup.
+// o = {prompt, sel, url, body, userMeta, onForce, after}
+async function runTurn(o){
+  const sel = o.sel;
+  const um = addMsg('user', o.userMeta);
+  um.querySelector('.body').textContent = o.prompt;
+  const provLabel = sel.provider === 'claude' ? 'Claude Code via Baseten \u00b7 tools' : (sel.provider === 'baseten' ? 'Baseten direct \u00b7 no tools' : 'Muse Code');
+  const am = addMsg('asst', (sel.model||'default model') + ' \u00b7 ' + (sel.effort||'') + ' \u00b7 ' + provLabel);
+  const body = am.querySelector('.body');
+  body.dataset.raw = '';
+  chatRunning = true; $('send').disabled = true; refreshBusyUI();
+  let ctrl = null;
+  try {
+    const r = await fetch(o.url, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(o.body),
+    });
+    if (r.status === 429) {
+      const j = await r.json().catch(()=>({}));
+      body.innerHTML = '<span class="warn">5-hour budget exhausted.</span> ' + esc(j.hint||'') +
+        '<br><button class="ghost" id="forcebtn" style="margin-top:8px">Run anyway</button> ' +
+        '<button class="ghost" id="qbtn2" style="margin-top:8px">Queue instead</button>';
+      $('forcebtn').onclick = o.onForce;
+      $('qbtn2').onclick = () => queuePromptText(o.body.prompt || o.prompt, sel);
+      return;
+    }
+    if (!r.ok) { const j = await r.json().catch(()=>({})); throw new Error(j.hint||j.error||('HTTP '+r.status)); }
+    ctrl = makeRunControls(am, o.prompt, sel);
+    await readChatStream(r, am);
+  } catch(e) {
+    const t=document.createElement('div'); t.className='warn'; t.textContent='\u26a0 '+e.message; body.appendChild(t);
+  } finally {
+    if (ctrl) ctrl.remove();
+    chatRunning = false; $('send').disabled = false; refreshBusyUI();
+    renderMermaid(); refreshWindow(); refreshRuns(); refreshQueue(); refreshConversations();
+    if (o.after) o.after();
+  }
+}
+
+async function sendChat(force=false, promptOverride=null, selOverride=null){
   // Voice: sending stops transcription first, so the full transcribed
   // text (including the last spoken words) is what gets sent — the
   // user never has to stop the mic before tapping Send.
   if (typeof stopVoiceAndFlush === 'function') await stopVoiceAndFlush();
   const prompt = (promptOverride || $('prompt').value).trim();
   if (!prompt) return;
-  const sel = currentSelections();
+  const sel = selOverride || currentSelections();
   const sentAtts = ATTACHMENTS.slice(); ATTACHMENTS = []; renderAttachments();
-  const um = addMsg('user', 'you · ' + new Date().toLocaleTimeString());
-  um.querySelector('.body').textContent = prompt + (sentAtts.length ? '\n\nAttachments: ' + sentAtts.map(a => a.name).join(', ') : '');
+  const attsNote = sentAtts.length ? '\n\nAttachments: ' + sentAtts.map(a => a.name).join(', ') : '';
   $('prompt').value = '';
-  const provLabel = sel.provider === 'claude' ? 'Claude Code via Baseten · tools' : (sel.provider === 'baseten' ? 'Baseten direct · no tools' : 'Muse Code');
-  const am = addMsg('asst', (sel.model||'default model') + ' · ' + sel.effort + ' · ' + provLabel);
-  const body = am.querySelector('.body'), tools = am.querySelector('.tools');
-  body.dataset.raw = '';
-  $('send').disabled = true;
-  try {
-    const r = await fetch('/api/chat' + (force?'':'') , {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({prompt, force, ...sel}),
-    });
-    if (r.status === 429) {
-      const j = await r.json();
-      body.innerHTML = '<span class="warn">5-hour budget exhausted.</span> ' + esc(j.hint||'') +
-        '<br><button class="ghost" id="forcebtn" style="margin-top:8px">Run anyway</button> ' +
-        '<button class="ghost" id="qbtn2" style="margin-top:8px">Queue instead</button>';
-      $('forcebtn').onclick = () => sendChat(true, prompt);
-      $('qbtn2').onclick = () => { $('prompt').value = prompt; queuePrompt(); };
-      return;
-    }
-    if (!r.ok) { const j = await r.json().catch(()=>({})); throw new Error(j.hint||j.error||('HTTP '+r.status)); }
-    const rd = r.body.getReader(), dec = new TextDecoder();
-    let buf = '';
-    for (;;) {
-      const {done, value} = await rd.read();
-      if (done) break;
-      buf += dec.decode(value, {stream:true});
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
-        const line = chunk.split('\n').find(l => l.startsWith('data:'));
-        if (!line) continue;
-        let ev; try { ev = JSON.parse(line.slice(5)); } catch(e){ continue; }
-        if (ev.kind === 'text') { body.dataset.raw = (body.dataset.raw || '') + (ev.text || ''); body.innerHTML = renderMarkdown(body.dataset.raw); }
-        else if (ev.kind === 'tool') { const t=document.createElement('div'); t.textContent='⚙ '+ev.name; tools.appendChild(t); }
-        else if (ev.kind === 'error') { const t=document.createElement('div'); t.className='warn'; t.textContent='⚠ '+(ev.error||'error'); body.appendChild(t); }
-        else if (ev.kind === 'usage') { am.querySelector('.meta').textContent += ' · ' + (ev.total_tokens||0).toLocaleString() + ' tok'; }
-        am.scrollIntoView({behavior:'smooth', block:'end'});
-      }
-    }
-  } catch(e) {
-    const t=document.createElement('div'); t.className='warn'; t.textContent='⚠ '+e.message; body.appendChild(t);
-  } finally { renderMermaid(); $('send').disabled = false; refreshWindow(); refreshRuns(); }
+  await runTurn({
+    prompt: prompt + attsNote, sel, url: '/api/chat',
+    body: Object.assign({prompt, force}, sel),
+    userMeta: 'you \u00b7 ' + new Date().toLocaleTimeString(),
+    onForce: () => sendChat(true, prompt),
+  });
+}
+
+// Force a queued item to run right now: the server stops any in-flight
+// run first, then streams this prompt like a normal chat turn.
+async function sendQueuedNow(it, force=false){
+  const sel = {
+    provider: it.provider || ((CFG && CFG.provider) || 'meta'),
+    model: it.model || null, effort: it.effort || null,
+    context_window: it.context_window || null, max_steps: it.max_steps || null,
+    workdir: it.workdir || null, auto_approve: !!it.auto_approve,
+    attachments: it.attachments || [],
+  };
+  await runTurn({
+    prompt: it.prompt, sel, url: '/api/queue/' + it.id + '/send-now',
+    body: {force},
+    userMeta: 'you \u00b7 ' + new Date().toLocaleTimeString() + ' \u00b7 from queue',
+    onForce: () => sendQueuedNow(it, true),
+    after: refreshQueue,
+  });
+}
+
+async function queuePromptText(prompt, sel){
+  if (!prompt || !prompt.trim()) return;
+  await api('/api/queue', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(Object.assign({prompt}, sel))});
+  refreshQueue();
 }
 
 async function queuePrompt(){
   if (typeof stopVoiceAndFlush === 'function') await stopVoiceAndFlush();
   const prompt = $('prompt').value.trim();
   if (!prompt) return;
-  await api('/api/queue', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({prompt, ...currentSelections()})});
+  const sel = currentSelections();
+  await queuePromptText(prompt, sel);
   $('prompt').value = ''; ATTACHMENTS = []; renderAttachments();
-  refreshQueue();
+}
+
+function refreshBusyUI(){
+  const show = chatRunning || serverBusy;
+  $('busypill').style.display = show ? '' : 'none';
+  $('busystop').style.display = show ? '' : 'none';
+}
+
+async function pollBusy(){
+  if (chatRunning) return;  // this tab's own run state is authoritative
+  try {
+    const w = await api('/api/window');
+    serverBusy = !!w.cli_busy;
+    refreshBusyUI();
+  } catch(e){}
 }
 
 async function refreshWindow(){
@@ -3356,24 +3699,64 @@ async function refreshQueue(){
     q.items.forEach(it => {
       const d = document.createElement('div'); d.className='qitem';
       d.innerHTML = '<span class="pill">'+esc(it.status)+'</span><span class="p">'+esc(it.prompt.slice(0,120))+'</span>';
+      const s = document.createElement('button'); s.className='ghost'; s.textContent='Send now';
+      s.title = 'Run this prompt right now (stops any in-flight run first)';
+      s.onclick = () => sendQueuedNow(it);
       const b = document.createElement('button'); b.className='ghost'; b.textContent='Remove';
       b.onclick = async () => { await fetch('/api/queue/'+it.id, {method:'DELETE'}); refreshQueue(); };
-      d.appendChild(b); el.appendChild(d);
+      d.appendChild(s); d.appendChild(b); el.appendChild(d);
     });
   } catch(e) {}
+}
+
+function renderConversationMessages(c){
+  $('chat').innerHTML = '';
+  if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · ' + (c.messages ? c.messages.length : 0) + ' exchanges';
+  if (c.messages) c.messages.forEach(m => {
+    const um = addMsg('user', 'you'); um.querySelector('.body').textContent = (m.prompt || '') + (m.attachments && m.attachments.length ? '\n\nAttachments: ' + m.attachments.join(', ') : '');
+    const am = addMsg('asst', (m.model || 'default model') + ' · ' + (m.effort || '') + ' · ' + (m.provider || ''));
+    const body = am.querySelector('.body'); body.dataset.raw = m.text || ''; body.innerHTML = renderMarkdown(body.dataset.raw);
+    if (m.error) { const t=document.createElement('div'); t.className='warn'; t.textContent='⚠ '+m.error; body.appendChild(t); }
+  });
+  renderMermaid();
 }
 
 async function restoreConversation(){
   try {
     const c = await api('/api/conversation');
-    $('chat').innerHTML = '';
-    if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · ' + (c.messages ? c.messages.length : 0) + ' exchanges';
-    if (c.messages) c.messages.forEach(m => {
-      const um = addMsg('user', 'you'); um.querySelector('.body').textContent = (m.prompt || '') + (m.attachments && m.attachments.length ? '\n\nAttachments: ' + m.attachments.join(', ') : '');
-      const am = addMsg('asst', (m.model || 'default model') + ' · ' + (m.effort || '') + ' · ' + (m.provider || ''));
-      const body = am.querySelector('.body'); body.dataset.raw = m.text || ''; body.innerHTML = renderMarkdown(body.dataset.raw);
-      if (m.error) { const t=document.createElement('div'); t.className='warn'; t.textContent='⚠ '+m.error; body.appendChild(t); }
+    renderConversationMessages(c);
+  } catch(e) {}
+}
+
+async function refreshConversations(){
+  try {
+    const c = await api('/api/conversations');
+    const el = $('convlist');
+    const items = (c.conversations || []).slice().reverse();  // newest first
+    if (!items.length) { el.innerHTML = '<span class="src">No previous conversations.</span>'; return; }
+    el.innerHTML = '';
+    items.forEach(it => {
+      const d = document.createElement('div');
+      d.className = 'convitem' + (it.current ? ' current' : '');
+      d.title = 'Open conversation ' + it.id + ' — resumes with its own memory';
+      const when = it.last_ts ? new Date(it.last_ts*1000).toLocaleString() : '';
+      const p = document.createElement('span'); p.className = 'p';
+      p.textContent = (it.preview || '(empty conversation)');
+      const m = document.createElement('span'); m.className = 'src';
+      m.textContent = it.messages + ' msgs' + (when ? ' · ' + when : '');
+      d.appendChild(p); d.appendChild(m);
+      d.onclick = () => openConversation(it.id);
+      el.appendChild(d);
     });
+  } catch(e) {}
+}
+
+async function openConversation(id){
+  try {
+    const c = await api('/api/conversations/' + id + '/open', {method:'POST'});
+    SESSION = crypto.randomUUID().replace(/-/g,'').slice(0,12);
+    renderConversationMessages(c);
+    refreshConversations();
   } catch(e) {}
 }
 
@@ -3579,7 +3962,8 @@ $('settings-removekey').onclick = async () => {
 $('send').onclick = () => sendChat(false);
 $('queuebtn').onclick = queuePrompt;
 $('prompt').addEventListener('keydown', e => { if ((e.metaKey||e.ctrlKey) && e.key==='Enter') sendChat(false); });
-$('newchat').onclick = async () => { try { const c = await api('/api/conversation/new', {method:'POST'}); if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · 0 exchanges'; } catch(e) {} SESSION = crypto.randomUUID().replace(/-/g,'').slice(0,12); $('chat').innerHTML=''; };
+$('newchat').onclick = async () => { try { const c = await api('/api/conversation/new', {method:'POST'}); if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · 0 exchanges'; } catch(e) {} SESSION = crypto.randomUUID().replace(/-/g,'').slice(0,12); $('chat').innerHTML=''; refreshConversations(); };
+$('busystop').onclick = async () => { try { await fetch('/api/stop', {method:'POST'}); } catch(e){} };
 $('plan').onchange = async () => {
   const plan = $('plan').value;
   const j = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -3644,10 +4028,12 @@ $('logoutbtn').onclick = async () => {
   loadAuth();
 };
 
-loadAll().then(()=>{ refreshWindow(); refreshQueue(); refreshRuns(); loadAuth(); wireAttachments(); });
+loadAll().then(()=>{ refreshWindow(); refreshQueue(); refreshRuns(); refreshConversations(); loadAuth(); wireAttachments(); });
 setInterval(refreshWindow, 10000);
 setInterval(refreshQueue, 5000);
 setInterval(refreshRuns, 15000);
+setInterval(refreshConversations, 15000);
+setInterval(pollBusy, 3000);
 </script>
 </body>
 </html>'''
