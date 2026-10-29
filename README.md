@@ -7,6 +7,26 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.0)
+
+- **Left bar redesign — the Settings window is gone.** Provider, model,
+  reasoning effort and context window now live directly on the left bar,
+  always visible, with the conversation list right below them.
+- **Provider dropdown** — Muse Code, Baseten (pre-created, built in),
+  and your own custom providers. Pick "Manage custom providers…" to
+  open a dialog where you create, edit and delete custom providers.
+  Each custom provider picks a harness — **Claude Code** (agentic CLI)
+  or **Direct API** (OpenAI-compatible) — plus its own base URL, model
+  and API key. Once created it appears in the dropdown.
+- **Keys** — selecting a provider with no saved key pops the key
+  dialog automatically. The 🔑 button next to the provider updates the
+  key any time; custom providers can also manage their key from the
+  providers dialog. Keys stay on the machine (Keychain or a mode-0600
+  file), one slot per provider.
+- **Recent runs** moved into a collapsed accordion below the
+  conversation list; Run options, Command-line tools and the 5-hour
+  budget are collapsed accordions too, so the bar stays short.
+
 ## What's inside (v0.5.0)
 
 - **Stop button** — while a prompt is running you now see a pulsing

@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -114,6 +114,17 @@ BASETEN_MODEL = "meta-models/muse-spark-open-1026"
 # reasoning off for Muse Spark Open — it reasons regardless.
 BASETEN_EFFORTS = ["low", "medium", "high", "xhigh"]
 BASETEN_MAX_TOKENS = 8192  # max output tokens per Baseten chat (reasoning counts toward it)
+# v0.6.0: provider model. Every provider has an id, a name, and a harness.
+# Harnesses: "muse" (muse CLI, Meta auth), "claude" (claude CLI against an
+# Anthropic-compatible base URL), "baseten" (direct OpenAI-compatible HTTP).
+# "meta" and "baseten" are builtin; everything else lives in
+# config["custom_providers"] as {id, name, harness, base_url, model, key_slot}.
+HARNESS_MUSE = "muse"
+HARNESS_CLAUDE = "claude"
+HARNESS_BASETEN = "baseten"
+PROVIDER_META = "meta"
+PROVIDER_BASETEN = "baseten"
+CUSTOM_HARNESSES = (HARNESS_CLAUDE, HARNESS_BASETEN)
 # Meta Model API base, OpenAI-compatible. Overridable for testing only via
 # MUSEPILOT_API_BASE; the default is the documented Meta base.
 API_BASE = os.environ.get("MUSEPILOT_API_BASE") or "https://api.meta.ai/v1"
@@ -688,11 +699,22 @@ class AuthManager:
 
     @staticmethod
     def _keychain_account(provider="meta"):
-        return AuthManager.KEYCHAIN_ACCOUNT_BASETEN if provider == "baseten" else AuthManager.KEYCHAIN_ACCOUNT
+        # v0.6.0: custom providers get their own keychain slot.
+        if provider == "baseten":
+            return AuthManager.KEYCHAIN_ACCOUNT_BASETEN
+        if provider == "meta":
+            return AuthManager.KEYCHAIN_ACCOUNT
+        return "CUSTOM_API_KEY_" + re.sub(r"[^A-Za-z0-9_]", "_", str(provider))[:32]
 
     @staticmethod
     def _key_file(provider="meta"):
-        return KEY_FILE_BASETEN if provider == "baseten" else KEY_FILE
+        # v0.6.0: custom providers get their own 0600 key file.
+        if provider == "baseten":
+            return KEY_FILE_BASETEN
+        if provider == "meta":
+            return KEY_FILE
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", str(provider))[:32]
+        return os.path.join(DATA_DIR, "api_key_" + safe)
 
     def get_baseten_key(self):
         """Baseten key: env BASETEN_API_KEY wins, else the saved Baseten slot. Secret: never log/return via API."""
@@ -1047,9 +1069,10 @@ DEFAULT_CONFIG = {
     "default_workdir": HOME,
     "auto_approve": False,        # maps to --yolo; off by default (safer)
     "auto_install_clis": True,   # v0.4.2: auto-download muse/claude if missing on launch
-    # v0.4.0: Settings selections are persisted for BOTH providers and
-    # restored on launch. "provider" is "meta" (v0.3.0 path) or "baseten".
+    # v0.6.0: "provider" is "meta", "baseten", or a custom provider id.
+    # Custom providers live in "custom_providers" (see resolve_provider).
     "provider": "meta",
+    "custom_providers": [],
     "baseten_effort": "xhigh",
     "baseten_model": BASETEN_MODEL,
     "default_context_window": None,
@@ -1693,11 +1716,12 @@ class QueueWorker(threading.Thread):
         if not item:
             return
         cfg = app.config
-        # v0.4.9: the 5-hour window budget is a Muse Code (Meta) limit only.
-        # Claude Code and Baseten direct run on Baseten, not on that window,
+        # v0.6.0: the 5-hour window budget is a muse-harness limit only.
+        # Other harnesses run on their own keys, not on that window,
         # so they must never be held by it — in the queue or in /api/chat.
-        qprovider = item.get("provider") or cfg.get("provider") or "meta"
-        ok, usage = (True, {}) if qprovider != "meta" else app.ledger.can_invoke(int(cfg.get("prompt_budget", 30)))
+        qspec = app.resolve_provider(item.get("provider") or cfg.get("provider") or "meta")
+        ok, usage = ((True, {}) if qspec["harness"] != HARNESS_MUSE
+                     else app.ledger.can_invoke(int(cfg.get("prompt_budget", 30))))
         if not ok:
             # put it back to queued; try again later
             with app.queue._lock:
@@ -1735,31 +1759,24 @@ class QueueWorker(threading.Thread):
                 save_run_record(record)
 
         qatts = resolve_attachments(item.get("attachments"))
+        # Effort default is harness-specific (see _run_chat_sse).
+        if qspec["harness"] == HARNESS_MUSE:
+            qeff = item.get("effort") or cfg.get("default_effort")
+        else:
+            qeff = item.get("effort") or cfg.get("baseten_effort") or "xhigh"
         try:
-            if (item.get("provider") or cfg.get("provider") or "meta") == "claude":
-                result = app.run_claude_chat(
-                    item["prompt"],
-                    effort=item.get("effort") or cfg.get("baseten_effort") or "xhigh",
-                    workdir=item.get("workdir") or cfg.get("default_workdir"),
-                    auto_approve=item.get("auto_approve", cfg.get("auto_approve", False)),
-                    on_event=on_event, attachments=qatts)
-            elif (item.get("provider") or cfg.get("provider") or "meta") == "baseten":
-                result = app.run_baseten_chat(
-                    item["prompt"],
-                    effort=item.get("effort") or cfg.get("baseten_effort") or "xhigh",
-                    on_event=on_event, attachments=qatts)
-            else:
-                result = app.driver.run(
-                    item["prompt"],
-                    model=item.get("model") or cfg.get("default_model"),
-                    effort=item.get("effort") or cfg.get("default_effort"),
-                    context_window=item.get("context_window"),
-                    max_steps=item.get("max_steps") or cfg.get("default_max_steps"),
-                    session_id=app.get_muse_session_id(),
-                    auto_approve=item.get("auto_approve", cfg.get("auto_approve", False)),
-                    workdir=item.get("workdir") or cfg.get("default_workdir"),
-                    on_event=on_event, attachments=qatts,
-                )
+            # v0.6.0: one dispatch for every harness.
+            result = app.run_provider_chat(
+                qspec, item["prompt"],
+                effort=qeff,
+                workdir=item.get("workdir") or cfg.get("default_workdir"),
+                auto_approve=item.get("auto_approve", cfg.get("auto_approve", False)),
+                on_event=on_event, attachments=qatts,
+                model=item.get("model") or cfg.get("default_model"),
+                context_window=item.get("context_window"),
+                max_steps=item.get("max_steps") or cfg.get("default_max_steps"),
+                session_id=app.get_muse_session_id(),
+            )
             record.update({
                 "status": "done" if result["ok"] else "error",
                 "text": result["text"],
@@ -1850,25 +1867,28 @@ CLAUDE_READ_TOOLS = "WebSearch,WebFetch,Read,Glob,Grep"
 CLAUDE_WRITE_TOOLS = "WebSearch,WebFetch,Read,Glob,Grep,Edit,Write,Bash"
 
 
-def claude_baseten_env(api_key):
+def claude_baseten_env(api_key, base_url=None, model=None):
+    # v0.6.0: base_url/model are per-provider (custom providers may point
+    # the Claude Code harness at any Anthropic-compatible endpoint).
     env = dict(os.environ)
-    env["ANTHROPIC_BASE_URL"] = CLAUDE_BASETEN_BASE_URL
+    env["ANTHROPIC_BASE_URL"] = base_url or CLAUDE_BASETEN_BASE_URL
     env["ANTHROPIC_AUTH_TOKEN"] = api_key
     env["ANTHROPIC_CUSTOM_HEADERS"] = "Authorization: Bearer " + api_key
-    env["ANTHROPIC_MODEL"] = BASETEN_MODEL
-    env["ANTHROPIC_SMALL_FAST_MODEL"] = BASETEN_MODEL
+    env["ANTHROPIC_MODEL"] = model or BASETEN_MODEL
+    env["ANTHROPIC_SMALL_FAST_MODEL"] = model or BASETEN_MODEL
     return env
 
 
 def claude_chat_stream(binary, api_key, prompt, effort, workdir, auto_approve, on_event, timeout=600, session_id=None, resume=False,
-                     stop_event=None, register_proc=None):
-    """Run `claude -p` (Baseten) and stream text/tool events.
+                     stop_event=None, register_proc=None, _env=None):
+    """Run `claude -p` and stream text/tool events.
 
     Returns (text, usage, error). Usage total = input + cache-read +
     output, matching how MusePilot counts Baseten direct usage.
     stop_event (threading.Event, optional) aborts the run promptly with
     "Run stopped by user."; register_proc(proc) exposes the child so a
-    stopper can terminate a hung process.
+    stopper can terminate a hung process. _env overrides the child
+    environment (v0.6.0: per-provider base URL / model).
     """
     import subprocess
     tools = CLAUDE_WRITE_TOOLS if auto_approve else CLAUDE_READ_TOOLS
@@ -1887,7 +1907,7 @@ def claude_chat_stream(binary, api_key, prompt, effort, workdir, auto_approve, o
     # --allowedTools LAST: it is variadic.
     argv += ["--allowedTools", tools]
     cwd = workdir if workdir and os.path.isdir(workdir) else HOME
-    env = claude_baseten_env(api_key)
+    env = _env if _env is not None else claude_baseten_env(api_key)
     text_parts = []
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     try:
@@ -1960,8 +1980,12 @@ def claude_chat_stream(binary, api_key, prompt, effort, workdir, auto_approve, o
 # ---------------------------------------------------------------------------
 
 def baseten_chat_stream(api_key, prompt, effort, on_event, max_tokens=BASETEN_MAX_TOKENS, attachments=None,
-                      stop_event=None):
-    """Stream one Baseten chat reply. Returns (text, usage, error).
+                      stop_event=None, base_url=None, model=None):
+    """Stream one direct-API chat reply. Returns (text, usage, error).
+
+    v0.6.0: base_url/model are per-provider (custom providers may point
+    the direct harness at any OpenAI-compatible endpoint); when omitted
+    the builtin Baseten defaults apply.
 
     Attachments (v0.4.8): Baseten direct has no file tools, so it cannot
     read a local path. Text files are inlined into the prompt (capped),
@@ -2002,7 +2026,7 @@ def baseten_chat_stream(api_key, prompt, effort, on_event, max_tokens=BASETEN_MA
         content = parts
         text_prompt = parts[0]["text"]
     body = {
-        "model": BASETEN_MODEL,
+        "model": model or BASETEN_MODEL,
         "messages": [{"role": "user", "content": content if content is not None else text_prompt}],
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -2011,7 +2035,7 @@ def baseten_chat_stream(api_key, prompt, effort, on_event, max_tokens=BASETEN_MA
     if effort:
         body["reasoning_effort"] = effort
     req = urllib.request.Request(
-        BASETEN_API_BASE + "/chat/completions",
+        (base_url or BASETEN_API_BASE).rstrip("/") + "/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         headers={"Authorization": "Bearer " + api_key,
                  "Content-Type": "application/json",
@@ -2088,30 +2112,203 @@ class App:
         self._models_cache_at = 0
         self._baseten_model_cache = None
         self._baseten_model_cache_at = 0
+        self._migrate_legacy_claude_provider()
 
-    def query_models(self, force=False):
-        """The Settings model list, in query order.
+    # ------------------------------------------------------------------
+    # Providers (v0.6.0)
+    # ------------------------------------------------------------------
+    def resolve_provider(self, pid=None):
+        """Resolve a provider id to its full spec.
 
-        Baseten branch (v0.4.0): the list is exactly one fixed model.
-        It is NOT queried from Meta — that is the whole point of the
-        provider radio. The model id is hardcoded by owner instruction;
-        the key is never hardcoded.
+        Returns {id, name, harness, base_url, model, builtin, key_slot}.
+        "meta" and "baseten" are builtin; other ids are looked up in
+        config["custom_providers"]. Unknown ids fall back to Muse Code
+        rather than breaking the chat.
         """
-        if (self.config.get("provider") or "meta") in ("baseten", "claude"):
-            # v0.4.5: Claude provider uses the SAME Baseten model and
-            # key, and the same live /v1/models context query. Only
-            # the driver differs (Claude CLI with tools vs direct API).
-            _prov = self.config.get("provider") or "meta"
-            # v0.4.1: context is prepopulated by QUERYING Baseten
-            # GET /v1/models (with the saved Baseten key), not from a
+        pid = pid or self.config.get("provider") or PROVIDER_META
+        if pid == PROVIDER_META:
+            return {"id": PROVIDER_META, "name": "Muse Code",
+                    "harness": HARNESS_MUSE, "base_url": None, "model": None,
+                    "builtin": True, "key_slot": "meta"}
+        if pid == PROVIDER_BASETEN:
+            return {"id": PROVIDER_BASETEN, "name": "Baseten",
+                    "harness": HARNESS_BASETEN, "base_url": BASETEN_API_BASE,
+                    "model": BASETEN_MODEL, "builtin": True,
+                    "key_slot": "baseten"}
+        for cp in self.config.get("custom_providers") or []:
+            if cp.get("id") == pid:
+                harness = cp.get("harness") or HARNESS_BASETEN
+                if harness not in CUSTOM_HARNESSES:
+                    harness = HARNESS_BASETEN
+                return {"id": pid, "name": cp.get("name") or pid,
+                        "harness": harness,
+                        "base_url": cp.get("base_url") or BASETEN_API_BASE,
+                        "model": cp.get("model") or BASETEN_MODEL,
+                        "builtin": False,
+                        "key_slot": cp.get("key_slot") or pid}
+        return self.resolve_provider(PROVIDER_META)
+
+    def _migrate_legacy_claude_provider(self):
+        """v0.6.0: the builtin "claude" provider became a custom provider
+        (Claude Code harness). Migrate the config once, keeping the
+        existing Baseten key slot so no key re-entry is needed."""
+        if (self.config.get("provider") or PROVIDER_META) != "claude":
+            return
+        cps = self.config.get("custom_providers") or []
+        new_id = "cp_" + uuid.uuid4().hex[:8]
+        cps.append({"id": new_id, "name": "Claude Code",
+                    "harness": HARNESS_CLAUDE,
+                    "base_url": CLAUDE_BASETEN_BASE_URL,
+                    "model": BASETEN_MODEL, "key_slot": "baseten"})
+        self.config["custom_providers"] = cps
+        self.config["provider"] = new_id
+        save_config(self.config)
+
+    def list_providers(self):
+        """All providers for the dropdown and the management dialog,
+        each with key presence. Never includes key values."""
+        specs = [self.resolve_provider(PROVIDER_META),
+                 self.resolve_provider(PROVIDER_BASETEN)]
+        for cp in self.config.get("custom_providers") or []:
+            if cp.get("id"):
+                specs.append(self.resolve_provider(cp.get("id")))
+        current = self.config.get("provider") or PROVIDER_META
+        meta_ok = self.auth.status()["ok"]
+        for spec in specs:
+            if spec["harness"] == HARNESS_MUSE:
+                # Muse Code uses the shared Meta auth (env / muse login /
+                # keychain / file), not a per-provider key.
+                spec["has_key"] = bool(meta_ok)
+                spec["key_kind"] = "meta"
+            else:
+                slot = spec["key_slot"]
+                env_hit = slot == "baseten" and bool(os.environ.get("BASETEN_API_KEY"))
+                spec["has_key"] = bool(env_hit or self.auth.stored_key_present(slot))
+                spec["key_kind"] = "provider"
+            spec["current"] = spec["id"] == current
+        return {"providers": specs, "current": current}
+
+    @staticmethod
+    def _validate_custom_provider(data):
+        name = (data.get("name") or "").strip()
+        harness = (data.get("harness") or "").strip()
+        base_url = (data.get("base_url") or "").strip()
+        model = (data.get("model") or "").strip()
+        if not name or len(name) > 60:
+            raise ValueError("Name is required (max 60 characters).")
+        if harness not in CUSTOM_HARNESSES:
+            raise ValueError("Harness must be 'claude' (Claude Code) or 'baseten' (direct API).")
+        if not re.match(r"^https?://", base_url) or len(base_url) > 500:
+            raise ValueError("Base URL must be an http(s) URL.")
+        if not model or len(model) > 200:
+            raise ValueError("Model is required (max 200 characters).")
+        return {"name": name, "harness": harness,
+                "base_url": base_url.rstrip("/"), "model": model}
+
+    def create_custom_provider(self, data):
+        """Create a custom provider. Returns its spec."""
+        clean = self._validate_custom_provider(data)
+        new_id = "cp_" + uuid.uuid4().hex[:8]
+        cps = self.config.get("custom_providers") or []
+        cps.append({"id": new_id, "key_slot": new_id, **clean})
+        self.config["custom_providers"] = cps
+        save_config(self.config)
+        return self.resolve_provider(new_id)
+
+    def update_custom_provider(self, pid, data):
+        """Update a custom provider's name/base_url/model/harness."""
+        cps = self.config.get("custom_providers") or []
+        for cp in cps:
+            if cp.get("id") == pid:
+                clean = self._validate_custom_provider({**cp, **data})
+                cp.update(clean)
+                self.config["custom_providers"] = cps
+                save_config(self.config)
+                return self.resolve_provider(pid)
+        raise KeyError(pid)
+
+    def delete_custom_provider(self, pid):
+        """Delete a custom provider (builtin ones refuse). Its key slot
+        is removed too. If it was current, fall back to Muse Code."""
+        if pid in (PROVIDER_META, PROVIDER_BASETEN):
+            raise ValueError("Builtin providers cannot be deleted.")
+        cps = [cp for cp in (self.config.get("custom_providers") or [])
+               if cp.get("id") != pid]
+        if len(cps) == len(self.config.get("custom_providers") or []):
+            raise KeyError(pid)
+        self.config["custom_providers"] = cps
+        if (self.config.get("provider") or PROVIDER_META) == pid:
+            self.config["provider"] = PROVIDER_META
+        save_config(self.config)
+        try:
+            self.auth.delete_api_key(pid)
+        except Exception:  # noqa: BLE001 - key cleanup is best-effort
+            pass
+        return True
+
+    def _provider_api_key(self, spec):
+        """The API key for a non-muse provider spec. Env BASETEN_API_KEY
+        wins for the builtin baseten slot; otherwise the saved slot.
+        Secret: never log or return via API."""
+        slot = spec["key_slot"]
+        if slot == "baseten":
+            env = os.environ.get("BASETEN_API_KEY")
+            if env:
+                return env
+        return self.auth.get_api_key(slot)
+
+    def run_provider_chat(self, spec, prompt, *, effort=None, workdir=None,
+                          auto_approve=False, on_event=None, attachments=None,
+                          model=None, context_window=None, max_steps=None,
+                          session_id=None):
+        """Dispatch one chat run to the provider's harness."""
+        harness = spec["harness"]
+        if harness == HARNESS_CLAUDE:
+            key = self._provider_api_key(spec)
+            if not key:
+                raise RuntimeError(
+                    "No API key saved for '%s'. Enter it with the key button "
+                    "next to the provider." % spec["name"])
+            return self.run_claude_chat(
+                prompt, effort=effort, workdir=workdir,
+                auto_approve=auto_approve, on_event=on_event,
+                attachments=attachments, base_url=spec["base_url"],
+                model=spec["model"], api_key=key)
+        if harness == HARNESS_BASETEN:
+            key = self._provider_api_key(spec)
+            if not key:
+                raise RuntimeError(
+                    "No API key saved for '%s'. Enter it with the key button "
+                    "next to the provider." % spec["name"])
+            return self.run_baseten_chat(
+                prompt, effort=effort, on_event=on_event,
+                attachments=attachments, base_url=spec["base_url"],
+                model=spec["model"], api_key=key)
+        return self.driver.run(
+            prompt, model=model, effort=effort,
+            context_window=context_window, max_steps=max_steps,
+            session_id=session_id, auto_approve=auto_approve,
+            workdir=workdir, on_event=on_event, attachments=attachments)
+
+    def query_models(self, force=False, provider_id=None):
+        """The model list for a provider, in query order.
+
+        v0.6.0: non-muse harnesses list exactly the provider's configured
+        model (fixed per provider). The muse harness lists the discovered
+        Meta models as before.
+        """
+        spec = self.resolve_provider(provider_id or self.config.get("provider") or "meta")
+        if spec["harness"] != HARNESS_MUSE:
+            # v0.4.1: context is prepopulated by QUERYING the provider's
+            # GET /v1/models (with the provider's key), not from a
             # constant. Without a key, or if the query fails, the
             # model id is still listed but context is unknown — never
             # guessed, and the error is shown.
-            key = self.auth.get_baseten_key()
+            key = self._provider_api_key(spec)
             ctx, models_error = None, None
             if key:
                 if force or not self._baseten_model_cache or (now_ts() - self._baseten_model_cache_at) >= 60:
-                    entry, qerr = query_baseten_model(key)
+                    entry, qerr = query_baseten_model(key, base=spec["base_url"])
                     self._baseten_model_cache = entry
                     self._baseten_model_cache_at = now_ts()
                     if qerr:
@@ -2124,11 +2321,12 @@ class App:
                     except (TypeError, ValueError):
                         ctx = None
             else:
-                models_error = "Save a Baseten key in Settings to query this model's context and effort details."
+                models_error = "Save an API key for '%s' (key button next to the provider) to query this model's context and effort details." % spec["name"]
+            harness_label = "Claude Code" if spec["harness"] == HARNESS_CLAUDE else "direct API"
             result = {
-                "models": [{"id": BASETEN_MODEL, "label": BASETEN_MODEL + " (Baseten)",
+                "models": [{"id": spec["model"], "label": spec["model"] + " (%s)" % spec["name"],
                             "context_window": ctx}],
-                "model_source": ("Claude Code (Baseten model, with tools) — Baseten /v1/models (live, key-authenticated)" if _prov == "claude" and key and not models_error else "Baseten /v1/models (live, key-authenticated)") if key and not models_error else "Baseten (fixed model — this provider supports only this model)",
+                "model_source": ("%s (%s) — /v1/models (live, key-authenticated)" % (spec["name"], harness_label)) if key and not models_error else "%s (fixed model — this provider supports only this model)" % spec["name"],
                 "models_error": models_error,
                 "cli_available": self.cli.available,
                 "cli_version": self.cli.version(),
@@ -2172,38 +2370,20 @@ class App:
         self._models_cache_at = now_ts()
         return result
 
-    def model_detail(self, model_id):
+    def model_detail(self, model_id, provider_id=None):
         """Per-model detail, queried AFTER the model is selected.
 
-        Baseten branch (v0.4.1): effort and context are prepopulated
-        by querying Baseten GET /v1/models (live), not constants.
+        v0.6.0: non-muse harnesses get the fixed-model detail for the
+        provider's configured model (context queried live from the
+        provider's /v1/models); the muse harness keeps the CLI path.
         """
-        if model_id == BASETEN_MODEL and (self.config.get("provider") or "meta") == "claude":
-            # v0.4.5 Claude detail: same model/key/context query as
-            # Baseten (via a recursive call with provider temporarily
-            # set to baseten, so the Baseten branch below runs), then
-            # override the Claude-specific fields.
-            saved_prov = self.config.get("provider")
-            self.config["provider"] = "baseten"
-            try:
-                detail = self.model_detail(model_id)
-            finally:
-                self.config["provider"] = saved_prov
-            detail["effort_source"] = "Claude Code --effort (low/medium/high/xhigh, default xhigh)"
-            detail["effort_scope"] = "per-model (Claude Code via Baseten) — effort maps to claude --effort; tools: WebSearch, WebFetch, Read, Glob, Grep pre-allowed, Edit/Write/Bash only with auto-approve"
-            detail["profile_note"] = "Claude Code agent via Baseten (Anthropic endpoint, no proxy). Session continuity in v0.4.7 — first run passes --session-id <uuid>, later runs pass --resume <uuid>; New conversation resets the uuid. Claude warns it does not recognise the model and assumes 200k context; true context is the queried 1M above."
-            return detail
-        if model_id == BASETEN_MODEL:
-            # v0.4.1: context is queried live from Baseten /v1/models.
-            # Effort levels are Baseten's documented Muse Spark Open
-            # row (low/medium/high/xhigh, default xhigh); /v1/models
-            # confirms the "reasoning" feature but does not publish
-            # an effort list, so the docs row is the source, labelled
-            # as such — never invented, never silently constant-filled.
-            key = self.auth.get_baseten_key()
+        spec = self.resolve_provider(provider_id or self.config.get("provider") or "meta")
+        if spec["harness"] != HARNESS_MUSE and model_id == spec["model"]:
+            # Context is queried live from the provider's /v1/models.
+            key = self._provider_api_key(spec)
             ctx, max_out, ctx_err = None, None, None
             if key:
-                entry, qerr = query_baseten_model(key)
+                entry, qerr = query_baseten_model(key, base=spec["base_url"])
                 if entry:
                     try:
                         ctx = int(entry.get("context_length")) if entry.get("context_length") is not None else None
@@ -2216,19 +2396,27 @@ class App:
                 else:
                     ctx_err = qerr
             if ctx:
-                ctx_note = "Queried from Baseten /v1/models: %s tokens (max completion %s tokens) - fixed model property, NOT a per-request setting on Baseten (a context_window parameter is silently ignored, live-tested). Send up to that many tokens in; MusePilot caps max output per reply at %s tokens." % ("{:,}".format(ctx), "{:,}".format(max_out) if max_out else "unknown", BASETEN_MAX_TOKENS)
+                ctx_note = "Queried from %s /v1/models: %s tokens (max completion %s tokens) - fixed model property, NOT a per-request setting (a context_window parameter is silently ignored, live-tested). Send up to that many tokens in; MusePilot caps max output per reply at %s tokens." % (spec["name"], "{:,}".format(ctx), "{:,}".format(max_out) if max_out else "unknown", BASETEN_MAX_TOKENS)
             else:
-                ctx_note = "Context not queried yet: %s" % (ctx_err or "save a Baseten key in Settings, then refresh models. Context is never guessed in MusePilot.")
+                ctx_note = "Context not queried yet: %s" % (ctx_err or "save an API key for '%s' (key button next to the provider), then refresh models. Context is never guessed in MusePilot." % spec["name"])
+            if spec["harness"] == HARNESS_CLAUDE:
+                effort_source = "Claude Code --effort (low/medium/high/xhigh, default xhigh)"
+                effort_scope = "per-model (Claude Code) — effort maps to claude --effort; tools: WebSearch, WebFetch, Read, Glob, Grep pre-allowed, Edit/Write/Bash only with auto-approve"
+                profile_note = "Claude Code agent (%s, no proxy). Session continuity in v0.4.7 — first run passes --session-id <uuid>, later runs pass --resume <uuid>; New conversation resets the uuid." % spec["base_url"]
+            else:
+                effort_source = "Baseten reasoning docs — Muse Spark Open row"
+                effort_scope = "per-model (direct API) — low/medium/high/xhigh, default xhigh"
+                profile_note = "Direct Chat Completions API. 'none'/'minimal' are not distinct levels for this model (docs: they run at low) and are not offered; reasoning cannot be turned off for Muse Spark Open."
             return {
-                "model": BASETEN_MODEL,
+                "model": spec["model"],
                 "reasoning_efforts": list(BASETEN_EFFORTS),
-                "effort_source": "Baseten reasoning docs — Muse Spark Open row",
-                "effort_scope": "per-model (Baseten) — low/medium/high/xhigh, default xhigh; low=231 vs xhigh=432 reasoning tokens on the same prompt (live-tested)",
+                "effort_source": effort_source,
+                "effort_scope": effort_scope,
                 "default_reasoning_effort": "xhigh",
                 "profile": None,
-                "profile_note": "Baseten Chat Completions does not use muse model-profile. 'none'/'minimal' are not distinct levels for this model (docs: they run at low) and are not offered; reasoning cannot be turned off for Muse Spark Open.",
+                "profile_note": profile_note,
                 "context_flag": None,
-                "context_source": "Baseten /v1/models (context_length, live query)",
+                "context_source": "%s /v1/models (context_length, live query)" % spec["name"],
                 "context_window": ctx,
                 "context_note": ctx_note,
             }
@@ -2269,25 +2457,32 @@ class App:
         }
 
 
-    def run_baseten_chat(self, prompt, effort=None, on_event=None, attachments=None):
-        """One Baseten chat, using the driver lock and ledger like Meta runs."""
-        key = self.auth.get_baseten_key()
+    def run_baseten_chat(self, prompt, effort=None, on_event=None, attachments=None,
+                         base_url=None, model=None, api_key=None):
+        """One direct-API chat, using the driver lock and ledger like Meta runs.
+
+        v0.6.0: base_url/model/api_key are per-provider; when omitted the
+        builtin Baseten defaults apply (key from env or the saved slot).
+        """
+        key = api_key or self.auth.get_baseten_key()
         if not key:
-            raise RuntimeError("No Baseten API key saved. Enter it in Settings under Baseten, then try again.")
+            raise RuntimeError("No Baseten API key saved. Enter it with the key button next to the provider, then try again.")
         if not self.driver._run_lock.acquire(blocking=False):
             raise RuntimeError("Another run is already in progress.")
         run_id = uuid.uuid4().hex[:12]
         started = now_ts()
         self.driver._stop_requested.clear()
+        eff_model = model or BASETEN_MODEL
         try:
             if on_event:
                 on_event("event", {"run_id": run_id, "cmd": "baseten chat completions"})
             text, usage, error = baseten_chat_stream(
                 key, prompt, effort or self.config.get("baseten_effort") or "xhigh", on_event,
-                attachments=attachments, stop_event=self.driver._stop_requested)
+                attachments=attachments, stop_event=self.driver._stop_requested,
+                base_url=base_url, model=eff_model)
             result = {"run_id": run_id, "ok": error is None, "error": error,
                       "text": text, "usage": usage, "steps": 0,
-                      "model": BASETEN_MODEL,
+                      "model": eff_model,
                       "effort": effort or self.config.get("baseten_effort") or "xhigh",
                       "elapsed": round(now_ts() - started, 1)}
             if on_event:
@@ -2488,8 +2683,13 @@ class App:
         save_config(self.config)
         return self.load_conversation()
 
-    def run_claude_chat(self, prompt, effort=None, workdir=None, auto_approve=False, on_event=None, attachments=None):
-        """One Claude Code (Baseten) run, using the driver lock + ledger.
+    def run_claude_chat(self, prompt, effort=None, workdir=None, auto_approve=False, on_event=None, attachments=None,
+                        base_url=None, model=None, api_key=None):
+        """One Claude Code run, using the driver lock + ledger.
+
+        v0.6.0: base_url/model/api_key are per-provider (custom providers
+        may point the Claude Code harness at any Anthropic-compatible
+        endpoint). When omitted, the builtin Baseten defaults apply.
 
         Session memory (v0.4.7): the first run in a conversation passes
         --session-id <uuid>; later runs pass --resume <uuid>. If a resume
@@ -2497,9 +2697,9 @@ class App:
         and tell the caller via the error text on total failure only — a
         successful retry keeps the conversation going on a new session.
         """
-        key = self.auth.get_baseten_key()
+        key = api_key or self.auth.get_baseten_key()
         if not key:
-            raise RuntimeError("No Baseten API key saved. Enter it in Settings under Baseten, then try again.")
+            raise RuntimeError("No Baseten API key saved. Enter it with the key button next to the provider, then try again.")
         binary = find_cli_binary("claude")
         if not binary:
             raise RuntimeError("Claude Code not found. MusePilot downloads it automatically on launch, or press Download in Command-line tools.")
@@ -2508,11 +2708,13 @@ class App:
         run_id = uuid.uuid4().hex[:12]
         started = now_ts()
         eff = effort or self.config.get("baseten_effort") or "xhigh"
+        eff_model = model or BASETEN_MODEL
         self.driver._stop_requested.clear()
         _reg = lambda p: setattr(self.driver, "active_proc", p)
+        _env = claude_baseten_env(key, base_url, eff_model)
         try:
             if on_event:
-                on_event("event", {"run_id": run_id, "cmd": "claude -p (Baseten)"})
+                on_event("event", {"run_id": run_id, "cmd": "claude -p"})
             session_id = self.get_claude_session_id()
             resume = self.get_claude_started()
             prompt_full = prompt + attachments_prompt_suffix(attachments or [])
@@ -2521,7 +2723,8 @@ class App:
                 workdir or self.config.get("default_workdir"),
                 auto_approve, on_event,
                 session_id=session_id, resume=resume,
-                stop_event=self.driver._stop_requested, register_proc=_reg)
+                stop_event=self.driver._stop_requested, register_proc=_reg,
+                _env=_env)
             if error and resume and any(w in error.lower() for w in ("resume", "session", "not found", "no such")):
                 # The stored session is gone (Claude storage cleared, etc).
                 # Retry once on a fresh session rather than failing forever.
@@ -2532,16 +2735,17 @@ class App:
                     workdir or self.config.get("default_workdir"),
                     auto_approve, on_event,
                     session_id=fresh_id, resume=False,
-                    stop_event=self.driver._stop_requested, register_proc=_reg)
+                    stop_event=self.driver._stop_requested, register_proc=_reg,
+                    _env=_env)
             if not error:
                 self.set_claude_started(True)
             result = {"run_id": run_id, "ok": error is None, "error": error,
                       "text": text, "usage": usage, "steps": 0,
-                      "model": BASETEN_MODEL, "effort": eff,
+                      "model": eff_model, "effort": eff,
                       "elapsed": round(now_ts() - started, 1)}
             if on_event:
                 on_event("done", result)
-            self.ledger.record({"ts": now_ts(), "model": BASETEN_MODEL,
+            self.ledger.record({"ts": now_ts(), "model": eff_model,
                                 "effort": eff,
                                 "input_tokens": usage["input_tokens"],
                                 "output_tokens": usage["output_tokens"],
@@ -2605,16 +2809,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self._send_json({"cli_available": False, "error": str(e)[:300]}, 500)
         elif path == "/api/models":
-            force = parsed.query == "refresh=1" or "refresh=1" in parsed.query
+            from urllib.parse import parse_qs as _pqs
+            _q = _pqs(parsed.query)
+            force = "refresh=1" in parsed.query
+            _prov = (_q.get("provider") or [None])[0]
             try:
-                self._send_json(app.query_models(force=force))
+                self._send_json(app.query_models(force=force, provider_id=_prov))
             except Exception as e:  # noqa: BLE001
                 self._send_json({"models": [], "model_source": "none",
                                  "models_error": str(e)[:300]}, 500)
         elif path.startswith("/api/models/"):
-            from urllib.parse import unquote
+            from urllib.parse import unquote, parse_qs as _pqs2
             model_id = unquote(path.rsplit("/", 1)[-1])
-            detail = app.model_detail(model_id)
+            _prov2 = (_pqs2(parsed.query).get("provider") or [None])[0]
+            detail = app.model_detail(model_id, provider_id=_prov2)
             if "error" in detail:
                 self._send_json(detail, 400)
             else:
@@ -2638,6 +2846,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(app.load_conversation())
         elif path == "/api/conversations":
             self._send_json({"conversations": app.list_conversations()})
+        elif path == "/api/providers":
+            self._send_json(app.list_providers())
         elif path == "/api/clis":
             self._send_json({"clis": self.server.app.cli_manager.status()})
         elif path == "/api/config":
@@ -2682,32 +2892,30 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
         provider = chat_provider
+        spec = app.resolve_provider(provider)
         chat_atts = resolve_attachments(body.get("attachments"))
+        # Effort default is harness-specific: the muse harness uses the
+        # configured default effort; claude/baseten harnesses default to
+        # the Baseten effort (xhigh).
+        if spec["harness"] == HARNESS_MUSE:
+            eff = body.get("effort") or cfg.get("default_effort")
+        else:
+            eff = body.get("effort") or cfg.get("baseten_effort") or "xhigh"
         try:
-            if provider == "claude":
-                result = app.run_claude_chat(
-                    prompt,
-                    effort=body.get("effort") or cfg.get("baseten_effort") or "xhigh",
-                    workdir=body.get("workdir") or cfg.get("default_workdir"),
-                    auto_approve=bool(body.get("auto_approve", cfg.get("auto_approve", False))),
-                    on_event=on_event, attachments=chat_atts)
-            elif provider == "baseten":
-                result = app.run_baseten_chat(
-                    prompt,
-                    effort=body.get("effort") or cfg.get("baseten_effort") or "xhigh",
-                    on_event=on_event, attachments=chat_atts)
-            else:
-                result = app.driver.run(
-                    prompt,
-                    model=body.get("model") or cfg.get("default_model"),
-                    effort=body.get("effort") or cfg.get("default_effort"),
-                    context_window=body.get("context_window"),
-                    max_steps=body.get("max_steps") or cfg.get("default_max_steps"),
-                    session_id=session_id,
-                    auto_approve=bool(body.get("auto_approve", cfg.get("auto_approve", False))),
-                    workdir=body.get("workdir") or cfg.get("default_workdir"),
-                    on_event=on_event, attachments=chat_atts,
-                )
+            # v0.6.0: one dispatch for every harness; custom providers
+            # ride the claude/baseten harnesses with their own base URL,
+            # model and key.
+            result = app.run_provider_chat(
+                spec, prompt,
+                effort=eff,
+                workdir=body.get("workdir") or cfg.get("default_workdir"),
+                auto_approve=bool(body.get("auto_approve", cfg.get("auto_approve", False))),
+                on_event=on_event, attachments=chat_atts,
+                model=body.get("model") or cfg.get("default_model"),
+                context_window=body.get("context_window"),
+                max_steps=body.get("max_steps") or cfg.get("default_max_steps"),
+                session_id=session_id,
+            )
             save_run_record({
                 "run_id": run_id_holder.get("run_id", uuid.uuid4().hex[:12]),
                 "prompt": prompt[:2000],
@@ -2750,6 +2958,52 @@ class Handler(BaseHTTPRequestHandler):
                              "busy": app.driver._run_lock.locked()})
             return
 
+        def _known_provider_id(pid):
+            if pid in (PROVIDER_META, PROVIDER_BASETEN):
+                return True
+            return any(cp.get("id") == pid
+                       for cp in app.config.get("custom_providers") or [])
+
+        # Custom provider management (v0.6.0).
+        if path == "/api/providers":
+            body = self._read_json()
+            try:
+                spec = app.create_custom_provider(body)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+                return
+            self._send_json({"provider": spec})
+            return
+
+        m = re.match(r"^/api/providers/([^/]+)/key$", path)
+        if m:
+            pid = m.group(1)
+            if not _known_provider_id(pid):
+                self._send_json({"error": "unknown provider"}, 404)
+                return
+            spec = app.resolve_provider(pid)
+            body = self._read_json()
+            key = (body.get("key") or "").strip()
+            slot = "meta" if spec["harness"] == HARNESS_MUSE else spec["key_slot"]
+            ok, msg = app.auth.save_api_key(key, slot)
+            self._send_json({"ok": ok, "message": msg}, 200 if ok else 400)
+            return
+
+        m = re.match(r"^/api/providers/([^/]+)$", path)
+        if m:
+            pid = m.group(1)
+            body = self._read_json()
+            try:
+                spec = app.update_custom_provider(pid, body)
+            except KeyError:
+                self._send_json({"error": "unknown provider"}, 404)
+                return
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+                return
+            self._send_json({"provider": spec})
+            return
+
         if path.startswith("/api/conversations/") and path.endswith("/open"):
             cid = path.rsplit("/", 2)[-2]
             try:
@@ -2768,16 +3022,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             cfg = app.config
             chat_provider = body.get("provider") or cfg.get("provider") or "meta"
+            chat_spec = app.resolve_provider(chat_provider)
             if app.driver._run_lock.locked():
-                busy_hint = ("Claude Code is already running — queue this prompt instead."
-                             if chat_provider == "claude" else
-                             "Baseten is already running — queue this prompt instead."
-                             if chat_provider == "baseten" else
-                             "Muse Code is already running — queue this prompt instead.")
+                busy_hint = ("%s is already running — queue this prompt instead."
+                             % chat_spec["name"])
                 self._send_json({"error": "busy", "hint": busy_hint}, 409)
                 return
             budget = int(cfg.get("prompt_budget", 30))
-            can, _usage = (True, {}) if chat_provider != "meta" else app.ledger.can_invoke(budget)
+            can, _usage = ((True, {}) if chat_spec["harness"] != HARNESS_MUSE
+                           else app.ledger.can_invoke(budget))
             if not can and not body.get("force"):
                 self._send_json({
                     "error": "window_exhausted",
@@ -2833,7 +3086,8 @@ class Handler(BaseHTTPRequestHandler):
                                      "hint": "Could not stop the running prompt."}, 409)
                     return
             app.queue.remove(item_id)
-            if provider == "meta" and not force:
+            sn_spec = app.resolve_provider(provider)
+            if sn_spec["harness"] == HARNESS_MUSE and not force:
                 budget = int(cfg.get("prompt_budget", 30))
                 can, _usage = app.ledger.can_invoke(budget)
                 if not can:
@@ -2952,6 +3206,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         parsed = urlparse(self.path)
         app = self.server.app
+        m = re.match(r"^/api/providers/([^/]+)/key$", parsed.path)
+        if m:
+            pid = m.group(1)
+            spec = app.resolve_provider(pid)
+            slot = "meta" if spec["harness"] == HARNESS_MUSE else spec["key_slot"]
+            ok, message = app.auth.delete_api_key(slot)
+            self._send_json({"ok": ok, "message": message})
+            return
+        m = re.match(r"^/api/providers/([^/]+)$", parsed.path)
+        if m:
+            pid = m.group(1)
+            try:
+                app.delete_custom_provider(pid)
+            except KeyError:
+                self._send_json({"error": "unknown provider"}, 404)
+                return
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+                return
+            self._send_json({"deleted": pid})
+            return
         if parsed.path.startswith("/api/queue/"):
             item_id = parsed.path.rsplit("/", 1)[-1]
             app.queue.remove(item_id)
@@ -3048,6 +3323,19 @@ UI_HTML = r'''<!DOCTYPE html>
   .runctrl { margin-top:8px; display:flex; gap:8px; align-items:center; }
   .runctrl button { padding:4px 10px; font-size:12px; }
   #busypill { color:var(--acc); border-color:var(--acc); animation:mp-pulse 1.2s ease-in-out infinite; }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; z-index:50; }
+  .modalbox { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; width:min(520px, 92vw); max-height:84vh; overflow-y:auto; }
+  .modalbox h3 { margin:0 0 10px; }
+  .modalbox h4 { margin:12px 0 6px; font-size:13px; color:var(--mut); }
+  .modalbox input[type=text], .modalbox input[type=password], .modalbox select { width:100%; background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
+  .provrow { display:flex; gap:8px; align-items:center; font-size:13px; padding:8px 0; border-bottom:1px dashed var(--line); }
+  .provrow .p { flex:1; min-width:0; }
+  .provrow .p .nm { color:var(--txt); font-weight:600; }
+  .provrow .p .dt { color:var(--mut); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .provrow button { padding:4px 10px; font-size:12px; }
+  details.acc { margin:10px 0; border:1px solid var(--line); border-radius:8px; background:var(--panel2); }
+  details.acc > summary { cursor:pointer; padding:8px 10px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); }
+  details.acc > div { padding:0 10px 10px; }
   .convitem { display:flex; gap:8px; align-items:center; font-size:12px; padding:6px 0;
               border-bottom:1px dashed var(--line); cursor:pointer; }
   .convitem .p { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--mut); }
@@ -3059,50 +3347,44 @@ UI_HTML = r'''<!DOCTYPE html>
 </head>
 <body>
 <div id="side">
+  <h3>Provider</h3>
+  <div class="field">
+    <div style="display:flex; gap:8px">
+      <select id="provider" style="flex:1"></select>
+      <button class="ghost" id="keybtn" title="Enter or update the API key for this provider">🔑</button>
+    </div>
+    <div class="src" id="providernote"></div>
+  </div>
   <h3>Model &amp; reasoning</h3>
   <div class="field"><label>Model</label><select id="model"></select><div class="src" id="modelsrc"></div></div>
   <div class="field"><label>Reasoning effort</label><select id="effort"></select><div class="src" id="effortsrc"></div></div>
   <div class="field"><label>Context window (tokens)</label><input type="number" id="ctx" min="1024" placeholder="blank = model default"><div class="src" id="ctxsrc"></div></div>
-  <h3>Run options</h3>
-  <div class="field"><label>Working directory</label><input type="text" id="workdir"></div>
-  <div class="field"><label>Max model steps</label><input type="number" id="maxsteps" min="1" max="500"></div>
-  <div class="field check"><input type="checkbox" id="yolo"><label for="yolo" style="margin:0">Auto-approve all actions <span class="warn">(yolo)</span></label></div>
-  <div class="field"><button class="ghost" id="newchat" style="width:100%">New conversation</button></div>
-  <div class="field"><span class="src" id="convinfo"></span></div>
   <h3>Conversations</h3>
+  <div class="field"><button class="ghost" id="newchat" style="width:100%">New conversation</button></div>
   <div class="field"><div id="convlist"><span class="src">Loading…</span></div>
-  <div class="src">Previous chat sessions. Click one to open it; it resumes with its own memory.</div></div>
-  <h3>Authentication</h3>
-  <div class="field">
-    <span class="pill" id="authpill" style="cursor:pointer" title="Click for details">checking…</span>
-    <div class="src" id="authdetail"></div>
-    <div id="authmore" style="display:none; margin-top:8px; font-size:12px; color:var(--mut)"></div>
-  </div>
-  <div class="field" id="keyform">
-    <label>API key <span class="src">(stored in macOS Keychain)</span></label>
-    <input type="password" id="apikey" autocomplete="off" placeholder="META_API_KEY value">
-    <div class="row" style="display:flex; gap:8px; margin-top:8px">
-      <button class="ghost" id="savekey">Save key</button>
-      <button class="ghost" id="removekey">Remove key</button>
+  <div class="src">Previous chat sessions. Click one to open it; it resumes with its own memory.</div>
+  <div class="src" id="convinfo"></div></div>
+  <details class="acc" id="runsacc"><summary>Recent runs</summary><div><div id="runs"></div></div></details>
+  <details class="acc"><summary>Run options</summary><div>
+    <div class="field"><label>Working directory</label><input type="text" id="workdir"></div>
+    <div class="field"><label>Max model steps</label><input type="number" id="maxsteps" min="1" max="500"></div>
+    <div class="field check"><input type="checkbox" id="yolo"><label for="yolo" style="margin:0">Auto-approve all actions <span class="warn">(yolo)</span></label></div>
+  </div></details>
+  <details class="acc"><summary>Command-line tools</summary><div>
+    <div class="field">
+      <div class="src" id="clistatus">Checking…</div>
+      <div id="clitools"></div>
+      <div class="src">MusePilot downloads Muse Code and Claude Code automatically when they are missing (official installers only, verified by running --version after install). Use Download below to install or reinstall one manually.</div>
+      <div class="row" style="display:flex; gap:8px; margin-top:8px; align-items:center">
+        <label class="check" style="margin:0"><input type="checkbox" id="autoinstall"> Auto-download missing tools on launch</label>
+      </div>
     </div>
-    <div class="src" id="keynote"></div>
-  </div>
-  <div class="field"><button class="ghost" id="logoutbtn" style="width:100%">Sign out (muse logout)</button></div>
-  <h3>Command-line tools</h3>
-  <div class="field">
-    <div class="src" id="clistatus">Checking…</div>
-    <div id="clitools"></div>
-    <div class="src">MusePilot downloads Muse Code and Claude Code automatically when they are missing (official installers only, verified by running --version after install). Use Download below to install or reinstall one manually.</div>
-    <div class="row" style="display:flex; gap:8px; margin-top:8px; align-items:center">
-      <label class="check" style="margin:0"><input type="checkbox" id="autoinstall"> Auto-download missing tools on launch</label>
-    </div>
-  </div>
-  <h3>5-hour window budget</h3>
-  <div class="field"><label>Plan tier</label><select id="plan"></select></div>
-  <div class="field"><label>Prompt budget per 5h <span class="warn">(estimate — tune it)</span></label><input type="number" id="budget" min="1" max="100000"></div>
-  <div class="src">Meta publishes "10–50 prompts / 5h" for Everyday; higher tiers are 5x/20x/80x multiples. Token usage is shown for insight.</div>
-  <h3>Recent runs</h3>
-  <div id="runs"></div>
+  </div></details>
+  <details class="acc"><summary>5-hour budget</summary><div>
+    <div class="field"><label>Plan tier</label><select id="plan"></select></div>
+    <div class="field"><label>Prompt budget per 5h <span class="warn">(estimate \u2014 tune it)</span></label><input type="number" id="budget" min="1" max="100000"></div>
+    <div class="src">Meta publishes "10\u201350 prompts / 5h" for Everyday; higher tiers are 5x/20x/80x multiples. Token usage is shown for insight.</div>
+  </div></details>
 </div>
 <div id="main">
   <div id="topbar">
@@ -3115,57 +3397,43 @@ UI_HTML = r'''<!DOCTYPE html>
       <div id="meterlabel"><span id="dot"></span><span id="metertext">…</span><span id="metertokens"></span><span id="meternext"></span></div>
     </div>
     <span class="pill" id="cliver"></span>
-    <button class="ghost" id="settingsbtn">Settings</button>
   </div>
-  <div id="settings" style="display:none; border-bottom:1px solid var(--line); background:var(--panel); padding:16px 18px; max-height:55vh; overflow-y:auto">
-    <h2 style="margin:0 0 12px">Settings</h2>
-    <h3>Connect — Muse Code key</h3>
-    <p class="src" id="settings-authdetail">Checking…</p>
-    <div class="field">
-      <label>API key</label>
-      <input type="password" id="settings-apikey" autocomplete="off" placeholder="META_API_KEY value">
-      <div class="row" style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap">
-        <button class="ghost" id="settings-savekey">Save key</button>
-        <button class="ghost" id="settings-removekey">Remove key</button>
-        <button class="ghost" id="settings-refreshmodels">Validate &amp; refresh models</button>
+  <div id="provmodal" class="modal" style="display:none">
+    <div class="modalbox">
+      <h3>Custom providers</h3>
+      <div class="src" style="margin-bottom:10px">Baseten is built in and cannot be deleted. Custom providers use the Claude Code harness or the direct API harness with your own base URL, model and key.</div>
+      <div id="provlist"></div>
+      <h4 style="margin:14px 0 8px">New provider</h4>
+      <div class="field"><label>Name</label><input type="text" id="cp-name" placeholder="e.g. My Claude endpoint"></div>
+      <div class="field"><label>Harness</label><select id="cp-harness">
+        <option value="claude">Claude Code (agentic CLI, needs base URL + key + model)</option>
+        <option value="baseten">Direct API (OpenAI-compatible, needs base URL + key + model)</option>
+      </select></div>
+      <div class="field"><label>Base URL</label><input type="text" id="cp-baseurl" placeholder="https://..."></div>
+      <div class="field"><label>Model</label><input type="text" id="cp-model" placeholder="model id"></div>
+      <div class="src" id="cp-note"></div>
+      <div class="row" style="display:flex; gap:8px; margin-top:10px">
+        <button id="cp-save">Save provider</button>
+        <button class="ghost" id="cp-close">Close</button>
       </div>
-      <div class="src" id="settings-keynote"></div>
-      <div class="src">Saving a key immediately queries the available models (below). The key is stored on this machine only — macOS Keychain, or a mode-0600 file under ~/.musepilot/ elsewhere — and is never shown back or logged.</div>
     </div>
-    <h3>Provider</h3>
-    <div class="field">
-      <label><input type="radio" name="provider" value="meta" id="provider-meta"> Meta — queried models (Meta Model API / muse CLI, v0.3.0 path)</label><br>
-      <label><input type="radio" name="provider" value="baseten" id="provider-baseten"> Baseten — fixed model only (direct Baseten API, v0.4.0)</label><br>
-      <label><input type="radio" name="provider" value="claude" id="provider-claude"> Claude Code — Baseten model, with tools (WebSearch, files, shell; edits need auto-approve)</label>
-      <div class="src" id="provider-note">Switching provider switches the model list, effort list, and which key is used for chats. Selections are saved locally to ~/.musepilot/config.json and restored on next launch.</div>
-    </div>
-    <h3>Connect — Baseten key</h3>
-    <p class="src" id="settings-basetenauthdetail">Baseten key is separate from the Meta key. It is never hardcoded in MusePilot — enter it here.</p>
-    <div class="field">
-      <label>Baseten API key</label>
-      <input type="password" id="settings-basetenkey" autocomplete="off" placeholder="Baseten API key (b10_…)">
-      <div class="row" style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap">
-        <button class="ghost" id="settings-savebasetenkey">Save Baseten key</button>
-        <button class="ghost" id="settings-removebasetenkey">Remove Baseten key</button>
+  </div>
+  <div id="keymodal" class="modal" style="display:none">
+    <div class="modalbox">
+      <h3 id="keytitle">API key</h3>
+      <div class="src" id="keydetail" style="margin-bottom:10px"></div>
+      <div class="field"><label>API key</label>
+        <input type="password" id="keyinput" autocomplete="off" placeholder="paste the key">
       </div>
-      <div class="src" id="settings-basetenkeynote"></div>
-      <div class="src">Saving a Baseten key switches the provider to Baseten and shows its single fixed model below. The key is stored on this machine only — macOS Keychain, or a mode-0600 file under ~/.musepilot/ elsewhere — and is never shown back or logged.</div>
+      <div class="src" id="keynote"></div>
+      <div class="row" style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap">
+        <button id="keysave">Save key</button>
+        <button class="ghost" id="keyremove">Remove</button>
+        <button class="ghost" id="keylogout" style="display:none">Sign out (muse logout)</button>
+        <button class="ghost" id="keyclose">Cancel</button>
+      </div>
+      <div class="src">Keys are stored on this machine only — macOS Keychain, or a mode-0600 file under ~/.musepilot/ elsewhere — and are never shown back or logged.</div>
     </div>
-    <h3>Model</h3>
-    <div class="field"><label>Model (queried, never hardcoded)</label><select id="settings-model"></select><div class="src" id="settings-modelsrc"></div></div>
-    <div class="warn" id="settings-modelserror"></div>
-    <div class="field"><label>Or enter a model id manually</label>
-      <input type="text" id="settings-modelmanual" placeholder="e.g. muse-spark-1.3">
-      <div class="row" style="margin-top:8px"><button class="ghost" id="settings-usemanual">Use this model</button></div>
-      <div class="src">Manual entry is for when the live sources return no list. It is not validated by the CLI — model-profile returns knobs even for unknown ids.</div>
-    </div>
-    <h3>For the selected model</h3>
-    <div class="field"><label>Thinking / reasoning effort</label><select id="settings-effort"></select><div class="src" id="settings-effortsrc"></div></div>
-    <div class="field"><label>Context window (tokens)</label>
-      <input type="number" id="settings-ctxnum" min="1024" placeholder="blank = model default">
-      <div class="src" id="settings-ctxsrc"></div>
-    </div>
-    <div class="src" id="settings-profile"></div>
   </div>
   <div id="chat"></div>
   <div id="queuepanel">
@@ -3203,70 +3471,57 @@ let MODELS = null;
 function populateModels(modelsResult){
   MODELS = modelsResult;
   const list = modelsResult.models || [];
-  for (const selId of ['model', 'settings-model']) {
-    const sel = $(selId); if (!sel) continue;
-    const prev = sel.value;
-    sel.innerHTML = '';
-    const def = document.createElement('option'); def.value=''; def.textContent='(CLI default)'; sel.appendChild(def);
-    if (!list.length) { const nop = document.createElement('option'); nop.value=''; nop.textContent = modelsResult.cli_available ? '(no models returned — see error below)' : '(muse CLI not found)'; nop.disabled = true; sel.appendChild(nop); }
-    list.forEach(m => { const op=document.createElement('option'); op.value=m.id;
-      op.textContent = m.label + (m.context_window ? ' · ' + (m.context_window/1048576) + 'M ctx' : '');
-      sel.appendChild(op); });
-    if (CFG && CFG.default_model) sel.value = CFG.default_model;
-    else if (prev) sel.value = prev;
-  }
+  const sel = $('model');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  const def = document.createElement('option'); def.value=''; def.textContent='(CLI default)'; sel.appendChild(def);
+  if (!list.length) { const nop = document.createElement('option'); nop.value=''; nop.textContent = modelsResult.cli_available ? '(no models returned — see error below)' : '(muse CLI not found)'; nop.disabled = true; sel.appendChild(nop); }
+  list.forEach(m => { const op=document.createElement('option'); op.value=m.id;
+    op.textContent = m.label + (m.context_window ? ' · ' + (m.context_window/1048576) + 'M ctx' : '');
+    sel.appendChild(op); });
+  const p = currentProvider();
+  const wantModel = (p && p.harness !== 'muse' && p.model) ? p.model : (CFG && CFG.default_model);
+  if (wantModel) sel.value = wantModel;
+  else if (prev) sel.value = prev;
   const src = 'Source: ' + (modelsResult.model_source || 'none');
   $('modelsrc').textContent = src;
-  const ssrc = $('settings-modelsrc'); if (ssrc) ssrc.textContent = src;
-  const err = $('settings-modelserror'); if (err) err.textContent = modelsResult.models_error || '';
   if (modelsResult.models_error) $('modelsrc').textContent += ' · ' + modelsResult.models_error;
 }
 
 function populatePerModel(detail){
   if (!detail || detail.error) return;
-  for (const selId of ['effort', 'settings-effort']) {
-    const sel = $(selId); if (!sel) continue;
-    sel.innerHTML = '';
-    if (!(detail.reasoning_efforts || []).length) { const nop=document.createElement('option'); nop.value=''; nop.textContent='(no effort list returned)'; nop.disabled=true; sel.appendChild(nop); }
-    (detail.reasoning_efforts || []).forEach(e => { const op=document.createElement('option'); op.value=e; op.textContent=e; sel.appendChild(op); });
-    const want = detail.default_reasoning_effort || (CFG && CFG.default_effort) || 'high';
-    if ([...sel.options].some(o => o.value === want)) sel.value = want;
-  }
-  const provNow = (document.querySelector('input[name="provider"]:checked')||{}).value || (CFG && CFG.provider) || 'meta';
-  if (provNow === 'baseten' && CFG && CFG.baseten_effort) {
-    for (const selId of ['effort', 'settings-effort']) { const sel = $(selId); if (sel && [...sel.options].some(o => o.value === CFG.baseten_effort)) sel.value = CFG.baseten_effort; }
-  } else if (CFG && CFG.default_effort) {
-    for (const selId of ['effort', 'settings-effort']) { const sel = $(selId); if (sel && [...sel.options].some(o => o.value === CFG.default_effort)) sel.value = CFG.default_effort; }
-  }
+  const sel = $('effort');
+  sel.innerHTML = '';
+  if (!(detail.reasoning_efforts || []).length) { const nop=document.createElement('option'); nop.value=''; nop.textContent='(no effort list returned)'; nop.disabled=true; sel.appendChild(nop); }
+  (detail.reasoning_efforts || []).forEach(e => { const op=document.createElement('option'); op.value=e; op.textContent=e; sel.appendChild(op); });
+  const p = currentProvider();
+  const isMuse = !p || p.harness === 'muse';
+  const want = detail.default_reasoning_effort || (isMuse ? (CFG && CFG.default_effort) : (CFG && CFG.baseten_effort)) || 'high';
+  if ([...sel.options].some(o => o.value === want)) sel.value = want;
+  if (CFG) { if (isMuse) { if ([...sel.options].some(o => o.value === CFG.default_effort)) sel.value = CFG.default_effort; } else if ([...sel.options].some(o => o.value === CFG.baseten_effort)) sel.value = CFG.baseten_effort; }
   const esrc = 'Source: ' + (detail.effort_source || '') + ' · ' + (detail.effort_scope || '');
   $('effortsrc').textContent = esrc;
-  const ssrc = $('settings-effortsrc'); if (ssrc) ssrc.textContent = esrc;
   const ctxNote = detail.context_note || '';
   $('ctxsrc').textContent = ctxNote;
-  const sctx = $('settings-ctxsrc'); if (sctx) sctx.textContent = ctxNote;
   const ctxFlag = !!detail.context_flag;
   $('ctx').disabled = !ctxFlag;
   $('ctx').placeholder = ctxFlag ? 'blank = model default' : 'Native — not settable via CLI';
-  const sctxnum = $('settings-ctxnum'); if (sctxnum) { sctxnum.disabled = !ctxFlag; sctxnum.placeholder = ctxFlag ? 'blank = model default' : 'Native — not settable via CLI'; }
-  const prof = $('settings-profile');
-  if (prof) {
-    prof.textContent = detail.profile
-      ? ('Model profile: ' + Object.entries(detail.profile).map(([k,v]) => k + '=' + v).join(' · ') + ' — ' + (detail.profile_note || ''))
-      : 'No model-profile detail returned for this model.';
-  }
 }
 
-async function onModelChange(modelId){
-  for (const selId of ['model', 'settings-model']) { const sel = $(selId); if (!sel) continue;
-    if (!modelId) { sel.value = ''; continue; }
+async function onModelChange(modelId, providerId){
+  const sel = $('model');
+  if (!modelId) { sel.value = ''; }
+  else {
     if (![...sel.options].some(o => o.value === modelId)) { const op=document.createElement('option'); op.value=modelId; op.textContent=modelId; sel.appendChild(op); }
     sel.value = modelId;
   }
+  const pid = providerId || currentProviderId();
   if (modelId) {
-    const prov = (document.querySelector('input[name="provider"]:checked')||{}).value || (CFG && CFG.provider) || 'meta';
-    const body = prov === 'claude' ? {baseten_model: modelId, provider: 'claude'} : (prov === 'baseten' ? {baseten_model: modelId, provider: 'baseten'} : {default_model: modelId});
-    try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}); if (CFG) { CFG.provider = prov; if (prov === 'baseten' || prov === 'claude') CFG.baseten_model = modelId; else CFG.default_model = modelId; } } catch(e) {}
-    try { const d = await api('/api/models/' + encodeURIComponent(modelId)); populatePerModel(d); }
+    const p = currentProvider();
+    const isMuse = !p || p.harness === 'muse';
+    const body = isMuse ? {default_model: modelId} : {};
+    try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}); if (CFG && isMuse) CFG.default_model = modelId; } catch(e) {}
+    try { const d = await api('/api/models/' + encodeURIComponent(modelId) + '?provider=' + encodeURIComponent(pid)); populatePerModel(d); }
     catch(e) { $('ctxsrc').textContent = 'Could not query this model: ' + e.message; }
   } else {
     try { const o = OPTS || await api('/api/options'); populatePerModel({reasoning_efforts: o.reasoning_efforts || [], effort_source: o.effort_source, context_flag: o.context_flag, context_note: 'No model selected.'}); } catch(e) {}
@@ -3309,22 +3564,24 @@ async function refreshClis(){
 
 async function loadAll(refresh=false){
   try { window.MUSEPILOT_VERSION = document.querySelector('.ver') ? document.querySelector('.ver').textContent.replace(/^v/, '').split(' ')[0] : ''; } catch(e) {}
-  const [o, c, m] = await Promise.all([
+  const [o, c] = await Promise.all([
     api('/api/options' + (refresh ? '?refresh=1' : '')),
     api('/api/config'),
-    api('/api/models' + (refresh ? '?refresh=1' : '')).catch(e => ({models: [], model_source: 'none', models_error: e.message})),
   ]);
   OPTS = o; CFG = c.config;
   $('cliver').textContent = o.cli_available ? ('muse ' + (o.cli_version || 'found')) : 'muse CLI NOT FOUND';
-  populateModels(m);
-  const initial = CFG.default_model || (m.models && m.models[0] && m.models[0].id) || '';
-  if (initial) await onModelChange(initial);
-  else populatePerModel({reasoning_efforts: o.reasoning_efforts || [], effort_source: o.effort_source, context_flag: o.context_flag, context_note: 'Select a model (or enter one manually in Settings) to query its effort and context options.'});
-
-  const prov = CFG.provider || 'meta';
-  const provRadio = document.querySelector('input[name="provider"][value="'+prov+'"]');
-  if (provRadio) provRadio.checked = true;
-  if (CFG.default_context_window) { $('ctx').value = CFG.default_context_window; $('settings-ctxnum').value = CFG.default_context_window; }
+  await refreshProviders();
+  const pid = currentProviderId();
+  try {
+    const m = await api('/api/models' + (refresh ? '?refresh=1&' : '?') + 'provider=' + encodeURIComponent(pid))
+      .catch(e => ({models: [], model_source: 'none', models_error: e.message}));
+    populateModels(m);
+    const p = currentProvider();
+    const initial = (p && p.harness !== 'muse' && p.model) ? p.model : (CFG.default_model || (m.models && m.models[0] && m.models[0].id) || '');
+    if (initial) await onModelChange(initial, pid);
+    else populatePerModel({reasoning_efforts: o.reasoning_efforts || [], effort_source: o.effort_source, context_flag: o.context_flag, context_note: 'Select a model to query its effort and context options.'});
+  } catch(e) {}
+  if (CFG.default_context_window) { $('ctx').value = CFG.default_context_window; }
   $('workdir').value = CFG.default_workdir || '';
   $('maxsteps').value = CFG.default_max_steps || 40;
   $('yolo').checked = !!CFG.auto_approve;
@@ -3346,33 +3603,36 @@ async function loadAll(refresh=false){
 // "Muse Code" even when Baseten was selected — the bug the user
 // caught in the screenshot. This is the single place that sets them.
 function updateProviderLabels(){
-  const prov = (document.querySelector('input[name="provider"]:checked')||{}).value || (CFG && CFG.provider) || 'meta';
-  const isBaseten = prov === 'baseten';
-  const isClaude = prov === 'claude';
-  const send = $('send'); if (send) send.textContent = isClaude ? 'Send to Claude Code' : (isBaseten ? 'Send to Baseten' : 'Send to Muse Code');
+  const p = currentProvider();
+  const name = p ? p.name : 'Muse Code';
+  const harness = p ? p.harness : 'muse';
+  const isClaude = harness === 'claude';
+  const isDirect = harness === 'baseten';
+  const send = $('send'); if (send) send.textContent = 'Send to ' + name;
   const pr = $('prompt'); if (pr) pr.placeholder = isClaude
-    ? 'Ask Claude Code to do something… (it can search the web, read and edit code in the working directory — edits need auto-approve on)'
-    : isBaseten
-    ? 'Ask Baseten a question… (chat only — it cannot read, edit, or run code)'
+    ? 'Ask ' + name + ' to do something… (it can search the web, read and edit code in the working directory — edits need auto-approve on)'
+    : isDirect
+    ? 'Ask ' + name + ' a question… (chat only — it cannot read, edit, or run code)'
     : 'Ask Muse Code to do something… (it can read, edit and run code in the working directory)';
-  const vl = $('verlabel'); if (vl) vl.textContent = 'v' + (window.MUSEPILOT_VERSION || '') + (isClaude ? ' · Claude Code via Baseten (with tools)' : (isBaseten ? ' · Baseten direct chat (no tools)' : ' · drives muse exec'));
+  const vl = $('verlabel'); if (vl) vl.textContent = 'v' + (window.MUSEPILOT_VERSION || '') + (isClaude ? ' · ' + name + ' (Claude Code harness)' : (isDirect ? ' · ' + name + ' (direct API)' : ' · drives muse exec'));
   const q = $('qlist'); if (q && !q.querySelector('.qitem')) {
-    q.innerHTML = '<span class="src">Empty. Queue a prompt and it will ' + (isClaude ? 'invoke Claude Code' : (isBaseten ? 'ask Baseten' : 'invoke Muse Code')) + ' as soon as your 5-hour budget allows.</span>';
+    q.innerHTML = '<span class="src">Empty. Queue a prompt and it will ' + (isClaude ? 'invoke ' + esc(name) : (isDirect ? 'ask ' + esc(name) : 'invoke Muse Code')) + (harness === 'muse' ? ' as soon as your 5-hour budget allows.' : '.') + '</span>';
   }
   const hint = $('sendhint');
-  if (hint && OPTS && !OPTS.cli_available && !isBaseten) {
+  if (hint && OPTS && !OPTS.cli_available && harness === 'muse') {
     hint.textContent = (CFG && CFG.auto_install_clis !== false) ? 'Muse Code not found — downloading it automatically (see Command-line tools).' : 'Muse Code not found — press Download in Command-line tools.';
-  } else if (hint && isBaseten) {
-    hint.textContent = 'Baseten direct chat — no tools, no browsing.';
+  } else if (hint && isDirect) {
+    hint.textContent = name + ' direct chat — no tools, no browsing.';
   } else if (hint && isClaude) {
-    hint.textContent = 'Claude Code via Baseten — tools: WebSearch, WebFetch, files. Edits need auto-approve.';
+    hint.textContent = name + ' (Claude Code harness) — tools: WebSearch, WebFetch, files. Edits need auto-approve.';
+  } else if (hint) {
+    hint.textContent = '';
   }
 }
 
 function currentSelections(){
-  const provEl = document.querySelector('input[name="provider"]:checked');
   return {
-    provider: provEl ? provEl.value : (CFG && CFG.provider ? CFG.provider : 'meta'),
+    provider: currentProviderId(),
     model: $('model').value || null,
     effort: $('effort').value || null,
     context_window: $('ctx').value ? parseInt($('ctx').value,10) : null,
@@ -3573,7 +3833,7 @@ async function runTurn(o){
   const sel = o.sel;
   const um = addMsg('user', o.userMeta);
   um.querySelector('.body').textContent = o.prompt;
-  const provLabel = sel.provider === 'claude' ? 'Claude Code via Baseten \u00b7 tools' : (sel.provider === 'baseten' ? 'Baseten direct \u00b7 no tools' : 'Muse Code');
+  const provLabel = providerChatLabel(sel.provider);
   const am = addMsg('asst', (sel.model||'default model') + ' \u00b7 ' + (sel.effort||'') + ' \u00b7 ' + provLabel);
   const body = am.querySelector('.body');
   body.dataset.raw = '';
@@ -3694,7 +3954,7 @@ async function refreshQueue(){
   try {
     const q = await api('/api/queue');
     const el = $('qlist');
-    if (!q.items.length) { const provQ = (CFG && CFG.provider) || 'meta'; el.innerHTML = '<span class="src">Empty. Queue a prompt and it will ' + (provQ === 'claude' ? 'invoke Claude Code' : (provQ === 'baseten' ? 'ask Baseten' : 'invoke Muse Code')) + (provQ === 'meta' ? ' as soon as your 5-hour budget allows.' : '.') + '</span>'; return; }
+    if (!q.items.length) { const h = harnessOf(currentProviderId()), n = nameOf(currentProviderId()); el.innerHTML = '<span class="src">Empty. Queue a prompt and it will ' + (h === 'claude' ? 'invoke ' + esc(n) : (h === 'baseten' ? 'ask ' + esc(n) : 'invoke Muse Code')) + (h === 'muse' ? ' as soon as your 5-hour budget allows.' : '.') + '</span>'; return; }
     el.innerHTML = '';
     q.items.forEach(it => {
       const d = document.createElement('div'); d.className='qitem';
@@ -3875,92 +4135,231 @@ $('prompt').addEventListener('input', () => {
   }
 });
 
-// ---------------------------------------------------------------- settings
-$('settingsbtn').onclick = () => { const p = $('settings'); const show = p.style.display === 'none'; p.style.display = show ? 'block' : 'none'; $('settingsbtn').textContent = show ? 'Hide settings' : 'Settings'; if (show) { const a = $('settings-authdetail'); if (a) a.textContent = $('authdetail').textContent || ''; } };
-$('model').onchange = () => onModelChange($('model').value);
-$('settings-model').onchange = () => onModelChange($('settings-model').value);
-async function saveEffort(val){
-  const prov = (document.querySelector('input[name="provider"]:checked')||{}).value || (CFG && CFG.provider) || 'meta';
-  const body = prov === 'baseten' ? {baseten_effort: val} : {default_effort: val};
-  try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}); if (CFG) { if (prov === 'baseten') CFG.baseten_effort = val; else CFG.default_effort = val; } } catch(e) {}
+// ---------------------------------------------------------------- providers (v0.6.0)
+let PROVIDERS = [];
+
+async function refreshProviders(){
+  const j = await api('/api/providers');
+  PROVIDERS = j.providers || [];
+  const sel = $('provider');
+  const prev = sel.value || j.current || 'meta';
+  sel.innerHTML = '';
+  PROVIDERS.forEach(p => {
+    const op = document.createElement('option');
+    op.value = p.id;
+    op.textContent = p.name + (p.builtin ? '' : ' (custom)');
+    sel.appendChild(op);
+  });
+  const mo = document.createElement('option');
+  mo.value = '__manage__'; mo.textContent = '\u2699 Manage custom providers\u2026';
+  sel.appendChild(mo);
+  sel.value = PROVIDERS.some(p => p.id === prev) ? prev : (j.current || 'meta');
+  updateProviderNote();
 }
-$('effort').onchange = () => { $('settings-effort').value = $('effort').value; saveEffort($('effort').value); };
-$('settings-effort').onchange = () => { $('effort').value = $('settings-effort').value; saveEffort($('settings-effort').value); };
-async function saveContext(val){
-  try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({default_context_window: val ? parseInt(val,10) : null})}); if (CFG) CFG.default_context_window = val ? parseInt(val,10) : null; } catch(e) {}
+
+function currentProvider(){
+  const v = $('provider') ? $('provider').value : null;
+  return (PROVIDERS.find(p => p.id === v)) || null;
 }
-$('ctx').onchange = () => { $('settings-ctxnum').value = $('ctx').value; saveContext($('ctx').value); };
-$('settings-ctxnum').onchange = () => { $('ctx').value = $('settings-ctxnum').value; saveContext($('settings-ctxnum').value); };
-document.querySelectorAll('input[name="provider"]').forEach(r => r.addEventListener('change', async () => {
-  const prov = r.value;
-  try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({provider: prov})}); if (CFG) CFG.provider = prov; } catch(e) {}
+
+function currentProviderId(){
+  const p = currentProvider();
+  return p ? p.id : ((CFG && CFG.provider) || 'meta');
+}
+function harnessOf(pid){ const p = PROVIDERS.find(x => x.id === pid); return p ? p.harness : 'muse'; }
+function nameOf(pid){ const p = PROVIDERS.find(x => x.id === pid); return p ? p.name : 'Muse Code'; }
+function providerChatLabel(pid){
+  const h = harnessOf(pid), n = nameOf(pid);
+  return h === 'claude' ? n + ' · Claude Code · tools' : (h === 'baseten' ? n + ' · direct · no tools' : 'Muse Code');
+}
+
+function updateProviderNote(){
+  const p = currentProvider();
+  const el = $('providernote');
+  if (!p) { el.textContent = ''; return; }
+  const harness = p.harness === 'claude' ? 'Claude Code' : (p.harness === 'baseten' ? 'Direct API' : 'Muse Code');
+  const keyTxt = p.harness === 'muse' ? (p.has_key ? 'signed in' : 'not signed in') : (p.has_key ? 'key saved' : 'no key saved');
+  el.textContent = harness + ' \u00b7 ' + keyTxt;
+}
+
+async function onProviderChange(){
+  const v = $('provider').value;
+  if (v === '__manage__') { openProviderDialog(); $('provider').value = (CFG && CFG.provider) || 'meta'; return; }
+  try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({provider: v})}); if (CFG) CFG.provider = v; } catch(e){}
   updateProviderLabels();
-  try { populateModels(await api('/api/models?refresh=1')); const m = (await api('/api/models')).models || []; if (m.length) await onModelChange(m[0].id); } catch(e) {}
-}));
-$('settings-savebasetenkey').onclick = async () => {
-  const key = $('settings-basetenkey').value;
-  if (!key.trim()) return;
+  updateProviderNote();
+  await refreshModelsForProvider(v);
+  const p = currentProvider();
+  if (p && p.harness !== 'muse' && !p.has_key) openKeyModal(p);
+}
+
+async function refreshModelsForProvider(pid){
   try {
-    const j = await api('/api/auth/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, provider: 'baseten'})});
-    $('settings-basetenkey').value = '';
-    $('settings-basetenkeynote').textContent = j.message;
-    const provRadio = document.querySelector('input[name="provider"][value="baseten"]'); if (provRadio) provRadio.checked = true;
-    if (CFG) CFG.provider = 'baseten';
-    updateProviderLabels();
-    populateModels({models: j.models || [], model_source: j.model_source, models_error: j.models_error});
-    if ((j.models || []).length) await onModelChange(j.models[0].id);
-  } catch(e) { $('settings-basetenkeynote').textContent = e.message; }
-  loadAuth();
-};
-$('settings-removebasetenkey').onclick = async () => {
-  try {
-    const j = await fetch('/api/auth/key?provider=baseten', {method:'DELETE'}).then(r => r.json());
-    $('settings-basetenkeynote').textContent = j.message;
-  } catch(e) { $('settings-basetenkeynote').textContent = e.message; }
-  loadAuth();
-};
-$('ctx').oninput = () => { $('settings-ctxnum').value = $('ctx').value; };
-$('settings-ctxnum').oninput = () => { $('ctx').value = $('settings-ctxnum').value; };
-$('settings-usemanual').onclick = async () => {
-  const id = $('settings-modelmanual').value.trim();
-  if (!id) return;
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) { $('settings-modelserror').textContent = 'Invalid model id — use letters, digits, dot, underscore or hyphen only.'; return; }
-  $('settings-modelmanual').value = '';
-  await onModelChange(id);
-};
-$('settings-refreshmodels').onclick = async () => {
-  $('settings-keynote').textContent = 'Querying models…';
-  try {
-    const m = await api('/api/models?refresh=1');
+    const m = await api('/api/models?refresh=1&provider=' + encodeURIComponent(pid));
     populateModels(m);
-    $('settings-keynote').textContent = m.models_error ? ('Models: ' + m.models_error) : ('Models refreshed from ' + m.model_source + ' (' + m.models.length + ').');
-    const cur = $('settings-model').value || $('model').value;
-    if (cur) await onModelChange(cur);
-  } catch(e) { $('settings-keynote').textContent = 'Could not refresh models: ' + e.message; }
-};
-$('settings-savekey').onclick = async () => {
-  const key = $('settings-apikey').value;
-  if (!key.trim()) return;
+    const models = m.models || [];
+    if (models.length) await onModelChange(models[0].id, pid);
+  } catch(e){}
+}
+
+// ---- key modal ----
+let keyModalProvider = null;
+function openKeyModal(p){
+  keyModalProvider = p;
+  $('keytitle').textContent = 'API key \u2014 ' + p.name;
+  $('keyinput').value = '';
+  $('keynote').textContent = '';
+  $('keydetail').textContent = p.harness === 'muse'
+    ? 'Muse Code can also use `muse login`. Saving a key here stores META_API_KEY on this machine.'
+    : 'Required before ' + p.name + ' can run. Stored on this machine only.';
+  $('keylogout').style.display = p.harness === 'muse' ? '' : 'none';
+  $('keymodal').style.display = 'flex';
+  setTimeout(() => $('keyinput').focus(), 50);
+}
+function closeKeyModal(){ $('keymodal').style.display = 'none'; keyModalProvider = null; }
+
+// ---- custom providers dialog ----
+let editingProviderId = null;
+async function openProviderDialog(){
+  editingProviderId = null;
+  $('cp-name').value = ''; $('cp-baseurl').value = ''; $('cp-model').value = '';
+  $('cp-harness').value = 'claude'; $('cp-note').textContent = '';
+  $('cp-save').textContent = 'Save provider';
+  await refreshProviderDialog();
+  $('provmodal').style.display = 'flex';
+}
+function closeProviderDialog(){ $('provmodal').style.display = 'none'; editingProviderId = null; }
+
+async function refreshProviderDialog(){
+  const j = await api('/api/providers');
+  PROVIDERS = j.providers || [];
+  const el = $('provlist'); el.innerHTML = '';
+  PROVIDERS.forEach(p => {
+    const d = document.createElement('div'); d.className = 'provrow';
+    const info = document.createElement('div'); info.className = 'p';
+    const nm = document.createElement('div'); nm.className = 'nm';
+    nm.textContent = p.name + (p.builtin ? ' (built-in)' : '');
+    const dt = document.createElement('div'); dt.className = 'dt';
+    const harness = p.harness === 'claude' ? 'Claude Code' : (p.harness === 'baseten' ? 'Direct API' : 'Muse Code');
+    dt.textContent = harness + ' \u00b7 ' + (p.model || 'discovered models') + (p.base_url ? ' \u00b7 ' + p.base_url : '') + ' \u00b7 ' + (p.has_key ? 'key saved' : 'no key');
+    info.appendChild(nm); info.appendChild(dt); d.appendChild(info);
+    const kb = document.createElement('button'); kb.className = 'ghost';
+    kb.textContent = p.has_key ? 'Key \u2713' : 'Key'; kb.title = 'Enter or update the API key';
+    kb.onclick = () => { closeProviderDialog(); openKeyModal(p); };
+    d.appendChild(kb);
+    if (!p.builtin) {
+      const eb = document.createElement('button'); eb.className = 'ghost'; eb.textContent = 'Edit';
+      eb.onclick = () => {
+        editingProviderId = p.id;
+        $('cp-name').value = p.name;
+        $('cp-harness').value = p.harness;
+        $('cp-baseurl').value = p.base_url || '';
+        $('cp-model').value = p.model || '';
+        $('cp-save').textContent = 'Update provider';
+        $('cp-note').textContent = '';
+      };
+      const db = document.createElement('button'); db.className = 'ghost'; db.textContent = 'Delete';
+      db.onclick = async () => {
+        if (!confirm('Delete provider "' + p.name + '"? Its saved key is removed too.')) return;
+        try { await fetch('/api/providers/' + encodeURIComponent(p.id), {method:'DELETE'}); }
+        catch(e){}
+        editingProviderId = null; $('cp-save').textContent = 'Save provider';
+        await refreshProviderDialog(); await refreshProviders();
+      };
+      d.appendChild(eb); d.appendChild(db);
+    }
+    el.appendChild(d);
+  });
+}
+
+async function saveCustomProvider(){
+  const data = {
+    name: $('cp-name').value.trim(),
+    harness: $('cp-harness').value,
+    base_url: $('cp-baseurl').value.trim(),
+    model: $('cp-model').value.trim(),
+  };
+  $('cp-note').textContent = '';
   try {
-    const j = await api('/api/auth/key', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})});
-    $('settings-apikey').value = '';
-    $('settings-keynote').textContent = j.message;
-    populateModels({models: j.models || [], model_source: j.model_source, models_error: j.models_error});
-    if ((j.models || []).length) await onModelChange(j.models[0].id);
-  } catch(e) { $('settings-keynote').textContent = e.message; }
-  loadAuth();
-};
-$('settings-removekey').onclick = async () => {
+    let r;
+    if (editingProviderId) {
+      r = await fetch('/api/providers/' + encodeURIComponent(editingProviderId), {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
+    } else {
+      r = await fetch('/api/providers', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
+    }
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    editingProviderId = null; $('cp-save').textContent = 'Save provider';
+    $('cp-name').value = ''; $('cp-baseurl').value = ''; $('cp-model').value = '';
+    await refreshProviderDialog(); await refreshProviders();
+    // Select the new/edited provider, and prompt for its key if missing.
+    const pid = (j.provider && j.provider.id) || null;
+    if (pid) {
+      $('provider').value = pid;
+      await onProviderChange();
+    }
+  } catch(e) { $('cp-note').textContent = e.message; }
+}
+
+async function saveProviderKey(){
+  const p = keyModalProvider; if (!p) return;
+  const key = $('keyinput').value;
+  if (!key.trim()) { $('keynote').textContent = 'Enter a key first.'; return; }
   try {
-    const j = await fetch('/api/auth/key', {method:'DELETE'}).then(r => r.json());
-    $('settings-keynote').textContent = j.message;
-  } catch(e) { $('settings-keynote').textContent = e.message; }
-  loadAuth();
-  try { populateModels(await api('/api/models?refresh=1')); } catch(e) {}
-};
+    const r = await fetch('/api/providers/' + encodeURIComponent(p.id) + '/key', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key})});
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) throw new Error(j.message || j.error || ('HTTP ' + r.status));
+    $('keynote').textContent = j.message || 'Saved.';
+    $('keyinput').value = '';
+    await refreshProviders();
+    if ($('provmodal').style.display !== 'none') await refreshProviderDialog();
+  } catch(e) { $('keynote').textContent = e.message; }
+}
+
+async function removeProviderKey(){
+  const p = keyModalProvider; if (!p) return;
+  try {
+    const j = await fetch('/api/providers/' + encodeURIComponent(p.id) + '/key', {method:'DELETE'}).then(r => r.json());
+    $('keynote').textContent = j.message || 'Removed.';
+    await refreshProviders();
+    if ($('provmodal').style.display !== 'none') await refreshProviderDialog();
+  } catch(e) { $('keynote').textContent = e.message; }
+}
 
 $('send').onclick = () => sendChat(false);
 $('queuebtn').onclick = queuePrompt;
+async function saveEffort(val){
+  const p = currentProvider();
+  const isMuse = !p || p.harness === 'muse';
+  const body = isMuse ? {default_effort: val} : {baseten_effort: val};
+  try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}); if (CFG) { if (isMuse) CFG.default_effort = val; else CFG.baseten_effort = val; } } catch(e) {}
+}
+async function saveContext(val){
+  try { await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({default_context_window: val ? parseInt(val,10) : null})}); if (CFG) CFG.default_context_window = val ? parseInt(val,10) : null; } catch(e) {}
+}
+$('provider').onchange = onProviderChange;
+$('keybtn').onclick = () => { const p = currentProvider(); if (p) openKeyModal(p); };
+$('cp-save').onclick = saveCustomProvider;
+$('cp-close').onclick = closeProviderDialog;
+$('keysave').onclick = saveProviderKey;
+$('keyremove').onclick = removeProviderKey;
+$('keyclose').onclick = closeKeyModal;
+$('keylogout').onclick = async () => {
+  if (!confirm('Sign out of Muse Code? This clears the stored `muse login` credential (not a saved API key).')) return;
+  try {
+    const j = await api('/api/auth/logout', {method:'POST'});
+    $('keynote').textContent = j.message || 'Signed out.';
+  } catch(e) { $('keynote').textContent = e.message; }
+  await refreshProviders();
+};
+$('provmodal').addEventListener('click', e => { if (e.target === $('provmodal')) closeProviderDialog(); });
+$('keymodal').addEventListener('click', e => { if (e.target === $('keymodal')) closeKeyModal(); });
+$('model').onchange = () => onModelChange($('model').value);
+$('effort').onchange = () => saveEffort($('effort').value);
+$('ctx').onchange = () => saveContext($('ctx').value);
 $('prompt').addEventListener('keydown', e => { if ((e.metaKey||e.ctrlKey) && e.key==='Enter') sendChat(false); });
 $('newchat').onclick = async () => { try { const c = await api('/api/conversation/new', {method:'POST'}); if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · 0 exchanges'; } catch(e) {} SESSION = crypto.randomUUID().replace(/-/g,'').slice(0,12); $('chat').innerHTML=''; refreshConversations(); };
 $('busystop').onclick = async () => { try { await fetch('/api/stop', {method:'POST'}); } catch(e){} };
@@ -3976,57 +4375,9 @@ $('budget').onchange = async () => {
   refreshWindow();
 };
 
-async function loadAuth(){
-  try {
-    const a = await api('/api/auth');
-    const pill = $('authpill');
-    pill.textContent = a.auth.ok ? '● Signed in' : '○ Not signed in — click for details';
-    pill.style.borderColor = a.auth.ok ? 'var(--ok)' : 'var(--bad)';
-    pill.style.color = a.auth.ok ? 'var(--ok)' : 'var(--bad)';
-    $('authdetail').textContent = a.auth.detail;
-    const acc = a.account || {};
-    $('authmore').innerHTML =
-      '<div><b>Credential:</b> ' + esc(acc.source || '—') + '</div>' +
-      (acc.email ? '<div><b>Account:</b> ' + esc(acc.email) + '</div>' : '') +
-      (acc.tier ? '<div><b>Tier:</b> ' + esc(acc.tier) + '</div>' : '') +
-      (acc.detail ? '<div class="src">' + esc(acc.detail) + '</div>' : '');
-    $('apikey').disabled = false; $('savekey').disabled = false; $('removekey').disabled = false;
-    const bn = $('settings-basetenkeynote');
-    if (bn && !bn.textContent) bn.textContent = a.auth.baseten_key ? ('Baseten key saved (' + (a.auth.baseten_store || 'stored') + ').') : 'No Baseten key saved yet.';
-    $('keynote').textContent = a.auth.keychain_available
-      ? 'Saved to your login Keychain; injected as META_API_KEY for muse runs. Env var still wins if set.'
-      : 'Saved to a mode-0600 file under ~/.musepilot/; injected as META_API_KEY for muse runs. Env var still wins if set.';
-  } catch(e) { $('authdetail').textContent = 'Could not check auth status.'; }
-}
-$('authpill').onclick = () => { const m = $('authmore'); m.style.display = m.style.display === 'none' ? 'block' : 'none'; };
-$('savekey').onclick = async () => {
-  const key = $('apikey').value;
-  if (!key.trim()) return;
-  try {
-    const j = await api('/api/auth/key', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({key})});
-    $('apikey').value = '';
-    $('keynote').textContent = j.message;
-    if (j.models) populateModels({models: j.models, model_source: j.model_source, models_error: j.models_error});
-    if ((j.models || []).length) await onModelChange(j.models[0].id);
-  } catch(e) { $('keynote').textContent = e.message; }
-  loadAuth();
-};
-$('removekey').onclick = async () => {
-  try {
-    const j = await fetch('/api/auth/key', {method:'DELETE'}).then(r => r.json());
-    $('keynote').textContent = j.message;
-  } catch(e) { $('keynote').textContent = e.message; }
-  loadAuth();
-};
-$('logoutbtn').onclick = async () => {
-  if (!confirm('Sign out of Muse Code? This clears the stored `muse login` credential (not a Keychain-saved API key).')) return;
-  try {
-    const j = await api('/api/auth/logout', {method:'POST'});
-    $('authdetail').textContent = j.message;
-  } catch(e) { $('authdetail').textContent = e.message; }
-  loadAuth();
-};
+// v0.6.0: auth status now lives in the provider note (updateProviderNote)
+// and the key modal. The key modal's logout button handles `muse logout`.
+async function loadAuth(){ try { await api('/api/providers'); } catch(e){} }
 
 loadAll().then(()=>{ refreshWindow(); refreshQueue(); refreshRuns(); refreshConversations(); loadAuth(); wireAttachments(); });
 setInterval(refreshWindow, 10000);
