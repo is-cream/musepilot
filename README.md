@@ -7,6 +7,14 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.7)
+
+- **Muse Code text extraction rewritten** — deep-scans the JSONL but
+  discards session ids (hex-dash ids), event/type words, and bare id
+  fragments; only human-readable strings survive. Copy buttons: ⧉ icon
+  below each message and at the top of code blocks. Queue button hidden
+  by default, shown only while something runs.
+
 ## What's inside (v0.6.6)
 
 - **Copy buttons** — every message (sent and received) has a Copy

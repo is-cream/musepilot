@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.6"
+VERSION = "0.6.7"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -1287,40 +1287,61 @@ def _find_usage(obj):
     return None
 
 
-def _extract_text(obj):
-    """Best-effort text extraction from a JSONL event object.
+# Session/event ids: hex with dashes (not always strict UUID shape).
+_UUID_RE = re.compile(r'[0-9a-f]{4,}(-[0-9a-f]{4,})+', re.I)
+# Event/type words emitted by `muse exec --json` — never user text.
+# (Single-word user replies are rare; the space/punctuation check in
+# _is_metadata_str keeps multi-word prose safe.)
+_METADATA_WORDS = frozenset({
+    'session', 'runtime', 'run', 'output', 'delta', 'event', 'type', 'subtype',
+    'command', 'accepted', 'reconciliation', 'durable', 'ephemeral', 'lifecycle',
+    'started', 'completed', 'terminal', 'usage', 'input', 'user', 'turn',
+    'linked', 'unsettled', 'configured', 'model', 'status', 'id', 'command_accepted',
+    'run_started', 'run_completed', 'session_event', 'output_delta', 'uncompleted',
+    'submit', 'up',
+})
 
-    v0.6.4: specific content fields only — never a deep scan. A deep
-    scan concatenates metadata (session ids, event names) into garbage.
-    Metadata events are filtered by parse_jsonl_line before this runs.
+def _is_metadata_str(s):
+    """True if s is a session/event id, not human text."""
+    s = s.strip()
+    if not s:
+        return True
+    if _UUID_RE.fullmatch(s):
+        return True
+    if s.lower() in _METADATA_WORDS:
+        return True
+    # Bare fragments without spaces are ids/keys, not prose.
+    if ' ' not in s and len(s) < 24 and not any(c in s for c in '.!?,:;—-'):
+        return True
+    return False
+
+def _extract_text(obj):
+    """Extract human text from a JSONL event object.
+
+    v0.6.6: deep-scan all strings, discarding session ids (UUIDs),
+    event/type words, and bare id fragments. Only human-readable
+    strings survive.
     """
-    if isinstance(obj, str):
-        return obj
-    if isinstance(obj, dict):
-        # content-bearing fields only
-        for key in ("delta", "text", "content", "message", "output",
-                    "response", "result", "text_content", "reply"):
-            if key in obj:
-                t = _extract_text(obj[key])
-                if t:
-                    return t
-        # OpenAI-style choices
-        choices = obj.get("choices")
-        if isinstance(choices, list) and choices:
-            t = _extract_text(choices[0])
-            if t:
-                return t
-        # nested message.content
-        msg = obj.get("message")
-        if isinstance(msg, dict):
-            t = _extract_text(msg.get("content"))
-            if t:
-                return t
-    if isinstance(obj, list):
-        parts = [_extract_text(v) for v in obj]
-        parts = [p for p in parts if p]
-        return "".join(parts) if parts else ""
-    return ""
+    parts = []
+    def _scan(o):
+        if isinstance(o, str):
+            if not _is_metadata_str(o):
+                parts.append(o.strip())
+        elif isinstance(o, dict):
+            for v in o.values():
+                _scan(v)
+        elif isinstance(o, list):
+            for v in o:
+                _scan(v)
+    _scan(obj)
+    # De-dupe while preserving order (streaming may repeat the full text).
+    seen = set()
+    uniq = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return ' '.join(uniq)
 
 
 def parse_jsonl_line(line):
@@ -3297,14 +3318,14 @@ UI_HTML = r'''<!DOCTYPE html>
   .msg { max-width:78%; padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
   .msg.user { align-self:flex-end; background:#2b3550; }
   .msg.asst { align-self:flex-start; background:var(--panel2); border:1px solid var(--line); }
-  .msg .meta { font-size:11px; color:var(--mut); margin-bottom:4px; display:flex; align-items:center; gap:8px; }
-  .msg .meta .metatext { flex:1; }
-  .msg .meta .copybtn { padding:2px 8px; font-size:11px; opacity:0.6; }
-  .msg .meta .copybtn:hover { opacity:1; }
+  .msg .meta { font-size:11px; color:var(--mut); margin-bottom:4px; }
+  .msg .msgfoot { margin-top:6px; display:flex; justify-content:flex-end; }
+  .msg .msgfoot .copybtn { padding:2px 8px; font-size:14px; opacity:0.5; }
+  .msg .msgfoot .copybtn:hover { opacity:1; }
   .codeblock { position:relative; margin:8px 0; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
   .codeblock .codehead { display:flex; align-items:center; justify-content:space-between; padding:4px 8px; background:var(--panel2); border-bottom:1px solid var(--line); }
   .codeblock .codelang { font-size:11px; color:var(--mut); text-transform:uppercase; }
-  .codeblock .copycode { padding:2px 8px; font-size:11px; }
+  .codeblock .copycode { padding:2px 8px; font-size:14px; }
   .codeblock pre { margin:0; }
   .msg .tools { font-size:12px; color:var(--mut); margin-top:8px; border-top:1px dashed var(--line); padding-top:6px; }
   .msg .body h1, .msg .body h2, .msg .body h3, .msg .body h4 { margin:14px 0 6px; line-height:1.3; }
@@ -3480,7 +3501,7 @@ UI_HTML = r'''<!DOCTYPE html>
       <button class="ghost" id="mic" title="Voice input (browser voice-to-text)">🎤 Voice input</button>
       <button class="ghost" id="attachbtn" title="Attach files or images — paste, drop, or pick">📎 Attach</button>
       <input type="file" id="fileinput" multiple style="display:none">
-      <button class="ghost" id="queuebtn">Queue for when available</button>
+      <button class="ghost" id="queuebtn" style="display:none">Queue for when available</button>
       <span class="src" id="micstatus"></span>
       <span class="src" id="sendhint"></span>
     </div>
@@ -3716,9 +3737,9 @@ function renderMarkdown(raw){
       const codeSrc = escAttr(buf.join('\n'));
       const langLabel = esc(lang || 'code');
       if (lang === 'mermaid') {
-        out.push('<div class="codeblock"><div class="codehead"><span class="codelang">mermaid</span><button class="ghost copycode" data-src="' + codeSrc + '">Copy</button></div><div class="mermaid-block"><pre><code class="language-mermaid">' + code + '</code></pre></div></div>');
+        out.push('<div class="codeblock"><div class="codehead"><span class="codelang">mermaid</span><button class="ghost copycode" data-src="' + codeSrc + '" title="Copy code">⧉</button></div><div class="mermaid-block"><pre><code class="language-mermaid">' + code + '</code></pre></div></div>');
       } else {
-        out.push('<div class="codeblock"><div class="codehead"><span class="codelang">' + langLabel + '</span><button class="ghost copycode">Copy</button></div><pre><code' + (lang ? ' class="language-' + esc(lang) + '"' : '') + '>' + code + '</code></pre></div>');
+        out.push('<div class="codeblock"><div class="codehead"><span class="codelang">' + langLabel + '</span><button class="ghost copycode" title="Copy code">⧉</button></div><pre><code' + (lang ? ' class="language-' + esc(lang) + '"' : '') + '>' + code + '</code></pre></div>');
       }
       continue;
     }
@@ -3812,7 +3833,7 @@ function wireAttachments(){
 function addMsg(role, meta){
   const d = document.createElement('div');
   d.className = 'msg ' + (role==='user'?'user':'asst');
-  d.innerHTML = '<div class="meta"><span class="metatext">'+esc(meta)+'</span><button class="ghost copybtn" title="Copy message">Copy</button></div><div class="body"></div><div class="tools"></div>';
+  d.innerHTML = '<div class="meta">'+esc(meta)+'</div><div class="body"></div><div class="tools"></div><div class="msgfoot"><button class="ghost copybtn" title="Copy message">⧉</button></div>';
   const copyBtn = d.querySelector('.copybtn');
   copyBtn.onclick = () => {
     const body = d.querySelector('.body');
@@ -3820,8 +3841,8 @@ function addMsg(role, meta){
     const text = body.dataset.raw || body.textContent || '';
     if (!text) return;
     navigator.clipboard.writeText(text).then(() => {
-      copyBtn.textContent = 'Copied!';
-      setTimeout(() => copyBtn.textContent = 'Copy', 1500);
+      copyBtn.textContent = '✓';
+      setTimeout(() => copyBtn.textContent = '⧉', 1500);
     }).catch(() => {});
   };
   $('chat').appendChild(d); d.scrollIntoView({behavior:'smooth', block:'end'});
