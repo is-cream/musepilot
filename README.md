@@ -7,6 +7,13 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.3)
+
+- **Muse Code streaming fixed** — the text extractor now deep-scans
+  `muse exec --json` output for any string content instead of only
+  known fields, so whatever the CLI emits appears in the chat as it
+  arrives (nothing silently dropped).
+
 ## What's inside (v0.6.2)
 
 - **Busy Queue button** — when a run is already going, the "already
