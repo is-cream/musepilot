@@ -7,6 +7,11 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.9)
+
+- **Message timestamps** — both sent and received messages now show
+  the time in the header (loaded history uses the saved timestamp).
+
 ## What's inside (v0.6.8)
 
 - **New conversation fix** — the button now shows an error if creation

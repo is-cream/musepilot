@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.8"
+VERSION = "0.6.9"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -3912,7 +3912,7 @@ async function runTurn(o){
   const um = addMsg('user', o.userMeta);
   um.querySelector('.body').textContent = o.prompt;
   const provLabel = providerChatLabel(sel.provider);
-  const am = addMsg('asst', (sel.model||'default model') + ' \u00b7 ' + (sel.effort||'') + ' \u00b7 ' + provLabel);
+  const am = addMsg('asst', (sel.model||'default model') + ' \u00b7 ' + (sel.effort||'') + ' \u00b7 ' + provLabel + ' \u00b7 ' + new Date().toLocaleTimeString());
   const body = am.querySelector('.body');
   body.dataset.raw = '';
   chatRunning = true; $('send').disabled = true; refreshBusyUI();
@@ -4058,12 +4058,17 @@ async function refreshQueue(){
   } catch(e) {}
 }
 
+function fmtTime(ts){
+  if (!ts) return '';
+  try { return new Date(ts*1000).toLocaleTimeString(); } catch(e) { return ''; }
+}
 function renderConversationMessages(c){
   $('chat').innerHTML = '';
   if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · ' + (c.messages ? c.messages.length : 0) + ' exchanges';
   if (c.messages) c.messages.forEach(m => {
-    const um = addMsg('user', 'you'); um.querySelector('.body').textContent = (m.prompt || '') + (m.attachments && m.attachments.length ? '\n\nAttachments: ' + m.attachments.join(', ') : '');
-    const am = addMsg('asst', (m.model || 'default model') + ' · ' + (m.effort || '') + ' · ' + (m.provider || ''));
+    const ts = m.ts ? ' · ' + fmtTime(m.ts) : '';
+    const um = addMsg('user', 'you' + ts); um.querySelector('.body').textContent = (m.prompt || '') + (m.attachments && m.attachments.length ? '\n\nAttachments: ' + m.attachments.join(', ') : '');
+    const am = addMsg('asst', (m.model || 'default model') + ' · ' + (m.effort || '') + ' · ' + (m.provider || '') + ts);
     const body = am.querySelector('.body'); body.dataset.raw = m.text || ''; body.innerHTML = renderMarkdown(body.dataset.raw);
     if (m.error) { const t=document.createElement('div'); t.className='warn'; t.textContent='⚠ '+m.error; body.appendChild(t); }
   });
