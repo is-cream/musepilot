@@ -7,6 +7,14 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.1)
+
+- **Queue button fixed** — during a run it now queues what is in the
+  prompt box (your next prompt), not a duplicate of the running prompt.
+- **Conversation list restyled** — two-line cards: the first prompt on
+  top, message count and time below; the current conversation is
+  highlighted.
+
 ## What's inside (v0.6.0)
 
 - **Left bar redesign — the Settings window is gone.** Provider, model,

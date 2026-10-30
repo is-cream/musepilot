@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -3336,10 +3336,13 @@ UI_HTML = r'''<!DOCTYPE html>
   details.acc { margin:10px 0; border:1px solid var(--line); border-radius:8px; background:var(--panel2); }
   details.acc > summary { cursor:pointer; padding:8px 10px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); }
   details.acc > div { padding:0 10px 10px; }
-  .convitem { display:flex; gap:8px; align-items:center; font-size:12px; padding:6px 0;
-              border-bottom:1px dashed var(--line); cursor:pointer; }
-  .convitem .p { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--mut); }
-  .convitem.current .p { color:var(--txt); font-weight:600; }
+  .convitem { display:block; font-size:12px; padding:8px 10px; margin:4px 0;
+              border:1px solid transparent; cursor:pointer; border-radius:8px; background:var(--panel2); }
+  .convitem:hover { border-color:var(--line); }
+  .convitem.current { border-color:var(--acc); background:var(--panel); }
+  .convitem .ct { color:var(--txt); font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .convitem.current .ct { font-weight:700; }
+  .convitem .cm { color:var(--mut); font-size:11px; margin-top:2px; }
   .convitem button { padding:4px 10px; font-size:12px; }
   #runs { font-size:12px; color:var(--mut); }
   .run { border-bottom:1px dashed var(--line); padding:6px 0; }
@@ -3797,8 +3800,12 @@ function makeRunControls(am, prompt, sel){
   stopBtn.onclick = async () => { try { await fetch('/api/stop', {method:'POST'}); } catch(e){} };
   const qBtn = document.createElement('button');
   qBtn.className = 'ghost'; qBtn.textContent = 'Queue';
-  qBtn.title = 'Queue this prompt to run after the current one';
-  qBtn.onclick = () => queuePromptText(prompt, sel);
+  qBtn.title = 'Queue what is in the prompt box to run after the current one finishes';
+  qBtn.onclick = () => {
+    const next = $('prompt') ? $('prompt').value.trim() : '';
+    if (!next) return;
+    queuePromptText(next, sel);
+  };
   ctrl.appendChild(w); ctrl.appendChild(stopBtn); ctrl.appendChild(qBtn);
   am.appendChild(ctrl);
   return ctrl;
@@ -4000,11 +4007,12 @@ async function refreshConversations(){
       d.className = 'convitem' + (it.current ? ' current' : '');
       d.title = 'Open conversation ' + it.id + ' — resumes with its own memory';
       const when = it.last_ts ? new Date(it.last_ts*1000).toLocaleString() : '';
-      const p = document.createElement('span'); p.className = 'p';
-      p.textContent = (it.preview || '(empty conversation)');
-      const m = document.createElement('span'); m.className = 'src';
-      m.textContent = it.messages + ' msgs' + (when ? ' · ' + when : '');
-      d.appendChild(p); d.appendChild(m);
+      const t = document.createElement('div'); t.className = 'ct';
+      t.textContent = (it.preview || '(empty conversation)');
+      const m = document.createElement('div'); m.className = 'cm';
+      const n = it.messages || 0;
+      m.textContent = n + (n === 1 ? ' message' : ' messages') + (when ? ' · ' + when : '') + (it.current ? ' · current' : '');
+      d.appendChild(t); d.appendChild(m);
       d.onclick = () => openConversation(it.id);
       el.appendChild(d);
     });
