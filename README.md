@@ -7,6 +7,15 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.2)
+
+- **Busy Queue button** — when a run is already going, the "already
+  running" message now has its promised **Queue instead** button (it
+  was text-only before).
+- **New conversations appear immediately** — the empty file is created
+  on New, so it shows in the list right away instead of only after the
+  first message.
+
 ## What's inside (v0.6.1)
 
 - **Queue button fixed** — during a run it now queues what is in the

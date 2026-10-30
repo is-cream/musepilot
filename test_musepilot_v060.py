@@ -37,7 +37,7 @@ def check(name, cond, detail=""):
     print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if detail and not cond else ""))
 
 
-check("version is 0.6.1", mp.VERSION == "0.6.1", mp.VERSION)
+check("version is 0.6.2", mp.VERSION == "0.6.2", mp.VERSION)
 
 app = mp.App()
 server = ThreadingHTTPServer(("127.0.0.1", 0), mp.Handler)

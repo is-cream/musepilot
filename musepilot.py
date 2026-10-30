@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -2572,15 +2572,26 @@ class App:
         save_config(self.config)
 
     def new_conversation(self):
-        """Start a fresh conversation: new saved file + fresh session ids."""
+        """Start a fresh conversation: new saved file + fresh session ids.
+
+        v0.6.2: the (empty) file is created immediately so the new
+        conversation appears in the list right away, not only after
+        its first message is saved.
+        """
         ensure_dirs()
         self.config["conversation_id"] = int(self.config.get("conversation_id") or 1) + 1
         self.config["claude_session_id"] = None
         self.config["claude_session_started"] = False
         self.config["muse_session_id"] = None
         save_config(self.config)
+        path = conversation_file_path(self.config["conversation_id"])
+        try:
+            if not os.path.isfile(path):
+                open(path, "a", encoding="utf-8").close()
+        except OSError:
+            pass
         return {"conversation_id": self.config["conversation_id"],
-                "file": conversation_file_path(self.config["conversation_id"]),
+                "file": path,
                 "messages": []}
 
     def append_conversation(self, provider, prompt, text, model=None, effort=None, error=None, attachments=None):
@@ -3829,6 +3840,13 @@ async function readChatStream(r, am){
       else if (ev.kind === 'tool') { const t=document.createElement('div'); t.textContent='\u2699 '+ev.name; tools.appendChild(t); }
       else if (ev.kind === 'error') { const t=document.createElement('div'); t.className='warn'; t.textContent='\u26a0 '+(ev.error||'error'); body.appendChild(t); }
       else if (ev.kind === 'usage') { am.querySelector('.meta').textContent += ' \u00b7 ' + (ev.total_tokens||0).toLocaleString() + ' tok'; }
+      else if (ev.kind === 'done') {
+        // v0.6.2: the done event carries the full text. If streaming
+        // produced nothing (no text events), fall back to it — otherwise
+        // a completed run shows an empty body.
+        if (!body.dataset.raw && ev.text) { body.dataset.raw = ev.text; body.innerHTML = renderMarkdown(ev.text); }
+        if (ev.error && !ev.ok) { const t=document.createElement('div'); t.className='warn'; t.textContent='\u26a0 '+(ev.error||'error'); body.appendChild(t); }
+      }
       am.scrollIntoView({behavior:'smooth', block:'end'});
     }
   }
@@ -3858,6 +3876,13 @@ async function runTurn(o){
         '<button class="ghost" id="qbtn2" style="margin-top:8px">Queue instead</button>';
       $('forcebtn').onclick = o.onForce;
       $('qbtn2').onclick = () => queuePromptText(o.body.prompt || o.prompt, sel);
+      return;
+    }
+    if (r.status === 409) {
+      const j = await r.json().catch(()=>({}));
+      body.innerHTML = '<span class="warn">\\u26a0 ' + esc(j.hint||j.error||'Already running.') + '</span>' +
+        '<br><button class="ghost" id="qbtn3" style="margin-top:8px">Queue instead</button>';
+      $('qbtn3').onclick = () => queuePromptText(o.body.prompt || o.prompt, sel);
       return;
     }
     if (!r.ok) { const j = await r.json().catch(()=>({})); throw new Error(j.hint||j.error||('HTTP '+r.status)); }
