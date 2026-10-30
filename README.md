@@ -7,6 +7,13 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.4)
+
+- **Muse Code output fixed** — the v0.6.3 extractor concatenated
+  session ids and event names into the chat (garbage). Now metadata
+  events (session/runtime/lifecycle) are dropped and text comes only
+  from content fields, so you see just the model's reply.
+
 ## What's inside (v0.6.3)
 
 - **Muse Code streaming fixed** — the text extractor now deep-scans

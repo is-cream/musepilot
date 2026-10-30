@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -1290,16 +1290,16 @@ def _find_usage(obj):
 def _extract_text(obj):
     """Best-effort text extraction from a JSONL event object.
 
-    v0.6.3: exhaustive fallback — if the known shapes miss, deep-scan
-    for any string content (skipping metadata keys) so a CLI's
-    streaming output is never silently dropped.
+    v0.6.4: specific content fields only — never a deep scan. A deep
+    scan concatenates metadata (session ids, event names) into garbage.
+    Metadata events are filtered by parse_jsonl_line before this runs.
     """
     if isinstance(obj, str):
         return obj
     if isinstance(obj, dict):
-        # common streaming shapes
+        # content-bearing fields only
         for key in ("delta", "text", "content", "message", "output",
-                    "response", "result", "data", "text_content", "reply"):
+                    "response", "result", "text_content", "reply"):
             if key in obj:
                 t = _extract_text(obj[key])
                 if t:
@@ -1316,24 +1316,6 @@ def _extract_text(obj):
             t = _extract_text(msg.get("content"))
             if t:
                 return t
-        # fallback: deep-scan for any string values, skipping metadata
-        skip = {"type", "id", "session_id", "timestamp", "ts", "event",
-                "level", "name", "tool", "model", "role"}
-        parts = []
-        def _scan(o):
-            if isinstance(o, str):
-                if o.strip():
-                    parts.append(o)
-            elif isinstance(o, dict):
-                for k, v in o.items():
-                    if k in skip:
-                        continue
-                    _scan(v)
-            elif isinstance(o, list):
-                for v in o:
-                    _scan(v)
-        _scan(obj)
-        return "".join(parts)
     if isinstance(obj, list):
         parts = [_extract_text(v) for v in obj]
         parts = [p for p in parts if p]
@@ -1364,6 +1346,10 @@ def parse_jsonl_line(line):
 
     if usage and (usage["total_tokens"] or usage["input_tokens"] or usage["output_tokens"]):
         return ("usage", usage)
+    # v0.6.4: metadata events (session, runtime, lifecycle) carry no
+    # user-facing text — drop them instead of leaking ids/event names.
+    if etype in ("session", "runtime", "lifecycle", "system", "ping"):
+        return None
     if any(k in etype for k in ("tool", "function_call", "tool_call")):
         name = obj.get("name") or obj.get("tool") or etype
         return ("tool", {"name": str(name), "detail": _extract_text(obj)[:300]})
@@ -1372,7 +1358,7 @@ def parse_jsonl_line(line):
     text = _extract_text(obj)
     if text:
         return ("text", {"text": text})
-    return ("event", {"raw": obj})
+    return None
 
 
 # ---------------------------------------------------------------------------
