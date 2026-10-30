@@ -7,6 +7,12 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.5)
+
+- **Queue button visibility** — the main Queue button now appears only
+  when something is already running (this tab or another). When idle,
+  Send is the action; Queue is hidden.
+
 ## What's inside (v0.6.4)
 
 - **Muse Code output fixed** — the v0.6.3 extractor concatenated

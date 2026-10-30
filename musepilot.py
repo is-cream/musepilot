@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -3966,6 +3966,10 @@ function refreshBusyUI(){
   const show = chatRunning || serverBusy;
   $('busypill').style.display = show ? '' : 'none';
   $('busystop').style.display = show ? '' : 'none';
+  // v0.6.4: the Queue button only makes sense when something is already
+  // running — otherwise Send is the action. Hide it when idle.
+  const qb = $('queuebtn');
+  if (qb) qb.style.display = show ? '' : 'none';
 }
 
 async function pollBusy(){
@@ -4422,7 +4426,7 @@ $('budget').onchange = async () => {
 // and the key modal. The key modal's logout button handles `muse logout`.
 async function loadAuth(){ try { await api('/api/providers'); } catch(e){} }
 
-loadAll().then(()=>{ refreshWindow(); refreshQueue(); refreshRuns(); refreshConversations(); loadAuth(); wireAttachments(); });
+loadAll().then(()=>{ refreshWindow(); refreshQueue(); refreshRuns(); refreshConversations(); loadAuth(); wireAttachments(); refreshBusyUI(); });
 setInterval(refreshWindow, 10000);
 setInterval(refreshQueue, 5000);
 setInterval(refreshRuns, 15000);
