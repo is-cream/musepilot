@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.7"
+VERSION = "0.6.8"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -4090,7 +4090,7 @@ async function refreshConversations(){
       d.title = 'Open conversation ' + it.id + ' — resumes with its own memory';
       const when = it.last_ts ? new Date(it.last_ts*1000).toLocaleString() : '';
       const t = document.createElement('div'); t.className = 'ct';
-      t.textContent = (it.preview || '(empty conversation)');
+      t.textContent = it.preview || (it.current ? '(new conversation)' : '(empty conversation)');
       const m = document.createElement('div'); m.className = 'cm';
       const n = it.messages || 0;
       m.textContent = n + (n === 1 ? ' message' : ' messages') + (when ? ' · ' + when : '') + (it.current ? ' · current' : '');
@@ -4451,7 +4451,17 @@ $('model').onchange = () => onModelChange($('model').value);
 $('effort').onchange = () => saveEffort($('effort').value);
 $('ctx').onchange = () => saveContext($('ctx').value);
 $('prompt').addEventListener('keydown', e => { if ((e.metaKey||e.ctrlKey) && e.key==='Enter') sendChat(false); });
-$('newchat').onclick = async () => { try { const c = await api('/api/conversation/new', {method:'POST'}); if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · 0 exchanges'; } catch(e) {} SESSION = crypto.randomUUID().replace(/-/g,'').slice(0,12); $('chat').innerHTML=''; refreshConversations(); };
+$('newchat').onclick = async () => {
+  try {
+    const c = await api('/api/conversation/new', {method:'POST'});
+    if (c.file) $('convinfo').textContent = 'Saved to ' + c.file + ' · 0 exchanges';
+    SESSION = crypto.randomUUID().replace(/-/g,'').slice(0,12);
+    $('chat').innerHTML='';
+    await refreshConversations();
+  } catch(e) {
+    $('convinfo').textContent = 'Failed to create conversation: ' + (e.message || e);
+  }
+};
 $('busystop').onclick = async () => { try { await fetch('/api/stop', {method:'POST'}); } catch(e){} };
 $('plan').onchange = async () => {
   const plan = $('plan').value;

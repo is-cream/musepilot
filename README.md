@@ -7,6 +7,13 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.8)
+
+- **New conversation fix** — the button now shows an error if creation
+  fails (was silently clearing); new empty conversations are labeled
+  "(new conversation)" instead of "(empty conversation)" so they're
+  recognizable in the list.
+
 ## What's inside (v0.6.7)
 
 - **Muse Code text extraction rewritten** — deep-scans the JSONL but
