@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "MusePilot"
-VERSION = "0.6.5"
+VERSION = "0.6.6"
 WINDOW_SECONDS = 5 * 3600  # the rolling usage window Meta documents for Muse Code
 
 HOME = os.path.expanduser("~")
@@ -3297,7 +3297,15 @@ UI_HTML = r'''<!DOCTYPE html>
   .msg { max-width:78%; padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
   .msg.user { align-self:flex-end; background:#2b3550; }
   .msg.asst { align-self:flex-start; background:var(--panel2); border:1px solid var(--line); }
-  .msg .meta { font-size:11px; color:var(--mut); margin-bottom:4px; }
+  .msg .meta { font-size:11px; color:var(--mut); margin-bottom:4px; display:flex; align-items:center; gap:8px; }
+  .msg .meta .metatext { flex:1; }
+  .msg .meta .copybtn { padding:2px 8px; font-size:11px; opacity:0.6; }
+  .msg .meta .copybtn:hover { opacity:1; }
+  .codeblock { position:relative; margin:8px 0; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .codeblock .codehead { display:flex; align-items:center; justify-content:space-between; padding:4px 8px; background:var(--panel2); border-bottom:1px solid var(--line); }
+  .codeblock .codelang { font-size:11px; color:var(--mut); text-transform:uppercase; }
+  .codeblock .copycode { padding:2px 8px; font-size:11px; }
+  .codeblock pre { margin:0; }
   .msg .tools { font-size:12px; color:var(--mut); margin-top:8px; border-top:1px dashed var(--line); padding-top:6px; }
   .msg .body h1, .msg .body h2, .msg .body h3, .msg .body h4 { margin:14px 0 6px; line-height:1.3; }
   .msg .body h1 { font-size:18px; } .msg .body h2 { font-size:16px; } .msg .body h3 { font-size:15px; } .msg .body h4 { font-size:14px; }
@@ -3489,6 +3497,7 @@ async function api(path, opts={}) {
   return j;
 }
 function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escAttr(s){ return esc(s).replace(/"/g,'&quot;'); }
 
 let MODELS = null;
 
@@ -3704,10 +3713,12 @@ function renderMarkdown(raw){
       while (i < lines.length && !lines[i].trim().startsWith('```')) { buf.push(lines[i]); i++; }
       i++; // closing fence
       const code = esc(buf.join('\n'));
+      const codeSrc = escAttr(buf.join('\n'));
+      const langLabel = esc(lang || 'code');
       if (lang === 'mermaid') {
-        out.push('<div class="mermaid-block"><pre><code class="language-mermaid">' + code + '</code></pre></div>');
+        out.push('<div class="codeblock"><div class="codehead"><span class="codelang">mermaid</span><button class="ghost copycode" data-src="' + codeSrc + '">Copy</button></div><div class="mermaid-block"><pre><code class="language-mermaid">' + code + '</code></pre></div></div>');
       } else {
-        out.push('<pre><code' + (lang ? ' class="language-' + esc(lang) + '"' : '') + '>' + code + '</code></pre>');
+        out.push('<div class="codeblock"><div class="codehead"><span class="codelang">' + langLabel + '</span><button class="ghost copycode">Copy</button></div><pre><code' + (lang ? ' class="language-' + esc(lang) + '"' : '') + '>' + code + '</code></pre></div>');
       }
       continue;
     }
@@ -3801,7 +3812,18 @@ function wireAttachments(){
 function addMsg(role, meta){
   const d = document.createElement('div');
   d.className = 'msg ' + (role==='user'?'user':'asst');
-  d.innerHTML = '<div class="meta">'+esc(meta)+'</div><div class="body"></div><div class="tools"></div>';
+  d.innerHTML = '<div class="meta"><span class="metatext">'+esc(meta)+'</span><button class="ghost copybtn" title="Copy message">Copy</button></div><div class="body"></div><div class="tools"></div>';
+  const copyBtn = d.querySelector('.copybtn');
+  copyBtn.onclick = () => {
+    const body = d.querySelector('.body');
+    // Assistant: copy raw markdown if available; user: copy text.
+    const text = body.dataset.raw || body.textContent || '';
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.textContent = 'Copied!';
+      setTimeout(() => copyBtn.textContent = 'Copy', 1500);
+    }).catch(() => {});
+  };
   $('chat').appendChild(d); d.scrollIntoView({behavior:'smooth', block:'end'});
   return d;
 }
@@ -4427,6 +4449,24 @@ $('budget').onchange = async () => {
 async function loadAuth(){ try { await api('/api/providers'); } catch(e){} }
 
 loadAll().then(()=>{ refreshWindow(); refreshQueue(); refreshRuns(); refreshConversations(); loadAuth(); wireAttachments(); refreshBusyUI(); });
+
+// v0.6.6: delegated copy for code blocks (rendered via innerHTML).
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.copycode');
+  if (!btn) return;
+  // Mermaid: source stored in data-src (code element is replaced by SVG).
+  // Others: copy from the sibling code element.
+  let text = btn.dataset.src;
+  if (text === undefined) {
+    const codeEl = btn.closest('.codeblock').querySelector('code');
+    text = codeEl ? codeEl.textContent : '';
+  }
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  }).catch(() => {});
+});
 setInterval(refreshWindow, 10000);
 setInterval(refreshQueue, 5000);
 setInterval(refreshRuns, 15000);

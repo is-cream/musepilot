@@ -7,6 +7,12 @@ a reasoning-effort tier and a context window, chat, and let MusePilot track your
 Zero dependencies: one Python 3 script, standard library only. No build step,
 no npm.
 
+## What's inside (v0.6.6)
+
+- **Copy buttons** — every message (sent and received) has a Copy
+  button in its header; every markdown code block has its own Copy
+  button at the top (mermaid blocks copy the source).
+
 ## What's inside (v0.6.5)
 
 - **Queue button visibility** — the main Queue button now appears only
